@@ -9,7 +9,8 @@
 build/
 vs*/
 
+
 # files
 *.zip
 compile_commands.json
-/lib/commonlibsse-ng
+lib/commonlibsse-ng
