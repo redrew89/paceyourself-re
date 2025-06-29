@@ -211,7 +211,9 @@ void DebugLocationKeywords(RE::BGSLocation* location) {
     SKSE::log::info("=== End Location Keyword Debug ===");
 }
 
+
 // Main movement decision function - native implementation of ShouldRunHere()
+// Add extra debug logging for combat state and config
 bool ShouldRunHere(RE::StaticFunctionTag*) {
     auto player = RE::PlayerCharacter::GetSingleton();
     if (!player) return true;
@@ -237,14 +239,24 @@ bool ShouldRunHere(RE::StaticFunctionTag*) {
     bool playerIsInCombat = player->IsInCombat() || player->AsActorState()->IsWeaponDrawn();
     bool changeCombatState = (g_config.combatRun != 0);
 
+    if (g_config.detailLog) {
+        SKSE::log::info("Combat state: {}, Weapon drawn: {}, playerIsInCombat: {}, combatRun: {}",
+            player->IsInCombat(), player->AsActorState()->IsWeaponDrawn(), playerIsInCombat, g_config.combatRun);
+    }
+
     if (playerIsInCombat) {
         if (!changeCombatState) {
             // Keep current movement state in combat
             auto playerControls = RE::PlayerControls::GetSingleton();
+            if (g_config.detailLog) {
+                SKSE::log::info("No combatRun override, returning current run state: {}", playerControls ? playerControls->data.running : true);
+            }
             return playerControls ? playerControls->data.running : true;
-        }
-        else {
+        } else {
             // Combat movement override
+            if (g_config.detailLog) {
+                SKSE::log::info("combatRun override active, returning: {}", (g_config.combatRun == 1));
+            }
             return (g_config.combatRun == 1);
         }
     }
@@ -334,6 +346,7 @@ bool ShouldRunHere(RE::StaticFunctionTag*) {
     SKSE::log::info("Defaulting to running");
     return true;
 }
+
 
 // Enhanced function that combines decision logic with state setting
 bool AutoSetPlayerMovement(RE::StaticFunctionTag*) {
