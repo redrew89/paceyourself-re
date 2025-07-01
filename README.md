@@ -1,7 +1,6 @@
 ﻿# Pace Yourself RE SKSE Rebuild 2.0.0
 
-A reimagined and expanded rework of Player Walks Indoors SE by TemplarSwift
-by redrew89
+A reimagined and expanded rework of Player Walks Indoors SE by TemplarSwift, rebuilt by redrew89
 
 ## Description
 
