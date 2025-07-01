@@ -30,7 +30,7 @@ Includes robust Mod Configuration Menu (MCM) support, various visual feedback op
 * SKSE64
 * Address Library for SKSE Plugins
 
-##Installation
+## Installation
 
 Install with a mod manager (MO2 or Vortex recommended). Load order is flexible. Configure settings in the MCM menu in-game.
 
