@@ -2,14 +2,16 @@
 
 A reimagined and expanded rework of Player Walks Indoors SE by TemplarSwift
 by redrew89
-📖 Description
+
+## Description
 
 Pace Yourself RE is a lightweight, immersive quality-of-life mod that automatically toggles the player's auto-run state based on location, combat status, and customizable settings. It improves immersion by encouraging more grounded movement—so you’re no longer charging through every tavern like a mammoth on skooma.
 
 Originally implemented entirely in Papyrus, core functionality has now been ported to a native SKSE DLL plugin (built with CommonLibSSE-NG) to provide better responsiveness, efficiency, and reliability.
 
 Includes robust Mod Configuration Menu (MCM) support, various visual feedback options, and extended compatibility hooks for modders.
-⚙️ Features
+
+## Features
 
     Automatically switch between walk/run based on:
         Interior/exterior location
@@ -24,15 +26,16 @@ Includes robust Mod Configuration Menu (MCM) support, various visual feedback op
     Exposed FormLists for keyword customization (dungeons/towns)
     Now using native C++ SKSE plugin for core state switching
 
-🧰 Requirements
+## Requirements
 
     SKSE64
     Address Library for SKSE Plugins
 
-📦 Installation
+##Installation
 
 Install with a mod manager (MO2 or Vortex recommended). Load order is flexible. Configure settings in the MCM menu in-game.
-📓 Changelog
+
+## Changelog
 v2.0 (SKSE DLL Upgrade)
 
     Refactored core logic into an SKSE plugin using CommonLibSSE-NG
@@ -55,12 +58,13 @@ v1.2
     Shader and message feedback for key events
     Gamepad-aware toggle (disables auto-toggling if a controller is detected)
 
-🤝 Credits
+
+## Credits
 
     Original concept: TemplarSwift — Player Walks Indoors SE
     Rework and plugin development: redrew89
 
-🪪 License
+## License
 
 Simplified BSD License
 
