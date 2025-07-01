@@ -35,6 +35,7 @@ Includes robust Mod Configuration Menu (MCM) support, various visual feedback op
 Install with a mod manager (MO2 or Vortex recommended). Load order is flexible. Configure settings in the MCM menu in-game.
 
 ## Changelog
+
 v2.0 (SKSE DLL Upgrade)
 
     Refactored core logic into an SKSE plugin using CommonLibSSE-NG
@@ -69,9 +70,8 @@ Simplified BSD License
 
 This software is provided "as is", without warranty of any kind. See included LICENSE file for details.
 
-This is an SKSE rebuild of the [Pace Yourself RE](https://www.nexusmods.com/skyrimspecialedition/mods/151365) 
 
-### Requirements
+### Build Requirements
 * [XMake](https://xmake.io) [2.8.2+]
 * C++23 Compiler (MSVC, Clang-CL)
 
