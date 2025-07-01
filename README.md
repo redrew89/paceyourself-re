@@ -12,23 +12,23 @@ Includes robust Mod Configuration Menu (MCM) support, various visual feedback op
 
 ## Features
 
-    Automatically switch between walk/run based on:
-        Interior/exterior location
-        Dungeon/town keywords
-        Player combat state
-        Distance from location center markers (for towns)
-    Player override detection when using the auto-run toggle
-    Feedback options:
-        Text notifications
-        Effect shaders (with accessibility options)
-    Optional logging to a custom logfile when Papyrus logging is enabled
-    Exposed FormLists for keyword customization (dungeons/towns)
-    Now using native C++ SKSE plugin for core state switching
+  * Automatically switch between walk/run based on:
+    * Interior/exterior location
+    * Dungeon/town keywords
+    * Player combat state
+    * Distance from location center markers (for towns)
+  * Player override detection when using the auto-run toggle
+  * Feedback options:
+    * Text notifications
+    * Effect shaders (with accessibility options)
+  * Optional logging to a custom logfile when Papyrus logging is enabled
+  * Exposed FormLists for keyword customization (dungeons/towns)
+  * Now using native C++ SKSE plugin for core state switching
 
 ## Requirements
 
-    SKSE64
-    Address Library for SKSE Plugins
+* SKSE64
+* Address Library for SKSE Plugins
 
 ##Installation
 
