@@ -537,6 +537,7 @@ Event OnUpdate()
 		return
 	endif
 	
+	CheckGamepad()
 	
 	; When a setting changes, call this instead of just UpdateNativeConfig
 	DebugMCMSettings(PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist)
