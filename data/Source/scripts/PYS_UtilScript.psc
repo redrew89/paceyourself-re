@@ -211,16 +211,17 @@ Function CheckGamepad()	Global
 	
 	PYS_MCMScript MCM = Game.GetFormFromFile(2817, "PaceYourself.esp") as PYS_MCMScript
 	
-	if Game.UsingGamepad()		
+	if Game.UsingGamepad() && MCM.PYS_Active.GetValueInt() != 0
 		MCM.LogMsg("Gamepad detected. Shutting down. Restart without gamepad to resume.")
 		MCM.PlayerRef.RemoveSpell(MCM.PYS_TrackerSpell)
 		MCM.PYS_Active.SetValueInt(0)
 		MCM.PYS_globalToggle = false
 		MCM.ToggleModFlag(false)
-	else
+	elseif !Game.UsingGamepad() && MCM.PYS_Active.GetValueInt() == 0
 		MCM.PYS_Active.SetValueInt(1)
 		MCM.PYS_globalToggle = true
 		MCM.ToggleModFlag(true)		
+		MCM.OnConfigInit()
 	endif
 
 	DebugMCMSettings(MCM.PYS_Active, MCM.PYS_combatRun, MCM.PYS_walkInTowns, MCM.PYS_walkInTownsUnwalled, MCM.PYS_walkInDungeons, MCM.PYS_maxDist)

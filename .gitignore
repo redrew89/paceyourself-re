@@ -8,10 +8,15 @@
 # folders
 build/
 vs*/
-
+data/scripts
+data/interface
+data/skse
 
 # files
 *.zip
+*.esp
+*.bsa
+meta.ini
 compile_commands.json
 lib/commonlibsse-ng
 paceyourself-re.code-workspace

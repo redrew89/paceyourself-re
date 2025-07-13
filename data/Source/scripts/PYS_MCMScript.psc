@@ -161,7 +161,7 @@ Event OnConfigInit()
 		refreshTime = self.PYS_refreshTime
 	endif
 
-	PYS_walkSpeedBase = PlayerRef.GetBaseActorValue("SpeedMult") as Int
+	
 	RegisterForSingleUpdate(refreshTime/3)
 	
 endEvent
@@ -537,9 +537,9 @@ Event OnUpdate()
 		return
 	endif
 	
+	
 	; When a setting changes, call this instead of just UpdateNativeConfig
 	DebugMCMSettings(PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist)
-	CheckGamepad()
 	Utility.Wait(0.5)
 	SetRunState(PlayerRef)
 	
@@ -551,10 +551,6 @@ Event OnKeyDown(int akKey)
 		;Discard input, player is in menu
 		LogMsg("Ignoring input while menu is open.",false)
 		return
-	endif
-		
-	if akKey == runKey 
-		PYS_playerOverride = true
 	endif
 		
 endevent
