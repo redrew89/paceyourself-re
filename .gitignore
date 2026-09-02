@@ -8,32 +8,9 @@
 # folders
 build/
 vs*/
-data/scripts
-data/interface
-data/skse
+
 
 # files
 *.zip
-*.esp
-*.bsa
-*.bak
-*.fuz
-*.wav
-*.tmp
-*.log
-*.zip
-*.7z
-*.rar
-*.dds
-*.nif
-*.tga
-*.esl
-*.esm
-*.bsl
-*.ini
-__pycache__/
-
-meta.ini
 compile_commands.json
-lib/commonlibsse-ng
-paceyourself-re.code-workspace
+;lib/commonlibsse-ng

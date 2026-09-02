@@ -50,6 +50,7 @@ bool Property PYS_playerOverride = false Auto
 bool Property PYS_simulatedKeyPress = false auto conditional
 bool Property PYS_detailLog = true auto conditional
 bool Property PYS_msgVerbose = true auto conditional
+bool Property PYS_hasSMC = false auto conditional
 
 ; Internal properties used to manage script behavior
 int Property PYS_walkSpeedMod Auto conditional
@@ -161,7 +162,7 @@ Event OnConfigInit()
 		refreshTime = self.PYS_refreshTime
 	endif
 
-	
+	PYS_walkSpeedBase = PlayerRef.GetBaseActorValue("SpeedMult") as Int
 	RegisterForSingleUpdate(refreshTime/3)
 	
 endEvent
@@ -250,10 +251,16 @@ Event OnPageReset(string Page)
 			AddTextOption("Pace Yourself RE disabled by gamepad. Please restart game without gamepad to enable.", none)	
 		endif
 	else
-		UnloadCustomContent()
+		UnloadCustomContent()		
 	endif	
-	
 		
+endEvent
+
+Event OnConfigClose()
+	
+	UpdateNativeConfig(PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist)
+	SetRunState(PlayerRef)
+	
 endEvent
 
 Event OnOptionMenuOpen(int option)
@@ -332,23 +339,16 @@ event OnOptionDefault(int option)
 		PYS_refreshTime = 30.0
 		refreshTime = PYS_refreshTime
 		SetToggleOptionValue(option,PYS_refreshTime,false)
-	elseif option == opt_DelayTime
-		PYS_waitTime = 0.1
-		waitTime = 0.1
-		SetToggleOptionValue(option, PYS_waitTime,false)
 	elseif option == opt_Timeout
 		PYS_timeout = 5.0
 		timeout = PYS_timeout
 		SetToggleOptionValue(option,PYS_timeout,false)
 	elseif option == opt_overrideToggleKey
-		PYS_overrideToggleKey = -10		
+		PYS_overrideToggleKey = Input.GetMappedKey("Toggle Auto Run")		
 		SetKeymapOptionValue(option,PYS_overrideToggleKey,false)
 	endIf
 	
-	if option == opt_overrideToggleKey
-		Initialize()
-	endif
-	
+
 	LogMsg("Set " + option + " value to default.",false)
 	
 	ForcePageReset()
@@ -374,13 +374,15 @@ event OnOptionKeyMapChange(int option, int keyCode, string conflictControl, stri
 		if (continue)
 			PYS_overrideToggleKey = keyCode
 			SetKeymapOptionValue(option, keyCode)
+			RegisterForKey(PYS_overrideToggleKey)
 			LogMsg("Set override key: " + keyCode)
 		endIf
 	endIf
 	
-	ForcePageReset()
-	Initialize()
 	
+	ForcePageReset()
+	RegisterForSingleUpdate(PYS_timeout)
+		
 endEvent
 
 string function GetCustomControl(int keyCode)
@@ -401,10 +403,12 @@ Event OnOptionSelect(int option)
 		if PYS_globalToggle
 			Initialize()
 		endif
+	
 	elseif option == opt_walkInDungeons
 		PYS_walkInDungeons = !PYS_walkInDungeons
 		SetToggleOptionValue(option, PYS_walkInDungeons,false)
 		LogMsg("Dungeon toggle set to " + PYS_walkInDungeons, false)
+	
 	elseif option == opt_walkInTowns
 		PYS_walkInTowns = !PYS_walkInTowns
 		SetToggleOptionValue(option, PYS_walkInTowns,false)
@@ -537,10 +541,6 @@ Event OnUpdate()
 		return
 	endif
 	
-	CheckGamepad()
-	
-	; When a setting changes, call this instead of just UpdateNativeConfig
-	DebugMCMSettings(PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist)
 	Utility.Wait(0.5)
 	SetRunState(PlayerRef)
 	
@@ -554,6 +554,10 @@ Event OnKeyDown(int akKey)
 		return
 	endif
 		
+	if akKey == runKey 
+		PYS_playerOverride = true
+	endif
+		
 endevent
 
 Event OnKeyUp(int akKey, float holdTime)
@@ -564,15 +568,10 @@ Event OnKeyUp(int akKey, float holdTime)
 		return
 	endif
 	
-	if (akKey == PYS_overrideToggleKey)
-		PYS_playerOverride = true ; Setting this true now until we can determine if it's valid, to avoid a race condition
-		SetOverride(akKey)		
-	endif	
-		
-	if akKey == autorunKey
+	if akKey == PYS_overrideToggleKey || akKey == autorunKey
 		PYS_playerOverride = true
-		SetOverride(akKey)	
-	endIf
+		SetOverride(akKey)
+	endif
 		
 endEvent
 
@@ -580,7 +579,7 @@ endEvent
 Function SetRunState(Actor akActor)
 
 	; Early validation
-	if akActor != Game.GetPlayer()
+	if akActor != PlayerRef
 		LogMsg("Invalid actor - skipping", false)
 		return
 	endif
@@ -624,7 +623,7 @@ Function SetRunState(Actor akActor)
 	endif
 	
 	; Perform the actual movement state change
-	HandleMovementLogic()
+	AutoSetPlayerMovement()
 	
 	; Schedule next update
 	self.RegisterForSingleUpdate(refreshTime)
@@ -635,12 +634,6 @@ Function SetOverride(int aKey = -1)
 
 	LogMsg("Setting player override in response to Keypress.",false)
 	
-	if aKey != -1 && aKey == PYS_overrideToggleKey		
-		Input.HoldKey(autorunKey)
-		Utility.Wait(waitTime)
-		Input.ReleaseKey(autorunKey)		
-	endIf
-
 	; Player manually toggled autorun with override key - set override logic
 	currentPlayerMode = Game.GetPlayerMovementMode()
 	
@@ -649,7 +642,7 @@ Function SetOverride(int aKey = -1)
 	LogMsg("simulated key press: " + self.PYS_simulatedKeyPress, false)
 	LogMsg("Player toggle matches script: " + (currentPlayerMode == setRun), false)
 	bool isOverridden = currentPlayerMode != setRun
-	
+		
 	
 	if isOverridden ; Set override if player's choice conflicts with script preference
 	
@@ -683,8 +676,11 @@ Function SetOverride(int aKey = -1)
 			PYS_ResumeMsg.Show()
 		endif
 	endif
-
 	
+	if aKey == PYS_overrideToggleKey 
+		SetPlayerWalkRunState(currentPlayerMode)
+	endif
+
 endfunction
 
 
@@ -693,7 +689,7 @@ Function ResetMarkerQuest()
 	PYS_LocationMarkerQuest.Reset()
 	PYS_LocationMarkerQuest.Stop()
 	PYS_LocationMarkerQuest.Start()
-	UpdateLocationMarker((PYS_LocationMarkerQuest.GetAlias(2) as ReferenceAlias).GetReference() as ObjectReference)
+	SetLocationMarker((PYS_LocationMarkerQuest.GetAlias(2) as ReferenceAlias).GetReference() as ObjectReference)
 
 endFunction
 
@@ -702,9 +698,9 @@ Function Initialize()
 	
 	PYS_UtilScript.CheckGamepad()
 		
-	if PYS_globalToggle && PYS_Active.GetValueInt() == 0
+	if !PYS_globalToggle || PYS_Active.GetValueInt() == 0
 		return
-	endif
+	endif 
 
 	if timeout != self.PYS_timeout
 		timeout = self.PYS_timeout
@@ -735,11 +731,43 @@ Function Initialize()
 	leftKey = Input.GetMappedKey("Strafe Left")
 	rightKey = Input.GetMappedKey("Strafe Right")
 	
+
+	; --- unregister previous bindings before re-registering, so repeat
+	; Initialize() calls (toggle mod, remap key) don't accumulate duplicate
+	; registrations on the same key ---
+	If runKey != -1
+		self.UnregisterForKey(runKey)
+	EndIf
+	If autorunKey != -1
+		self.UnregisterForKey(autorunKey)
+	EndIf
+	If sneakKey != -1
+		self.UnregisterForKey(sneakKey)
+	EndIf
+	If forwardKey != -1
+		self.UnregisterForKey(forwardKey)
+	EndIf
+	If backKey != -1
+		self.UnregisterForKey(backKey)
+	EndIf
+	If leftKey != -1
+		self.UnregisterForKey(leftKey)
+	EndIf
+	If rightKey != -1
+		self.UnregisterForKey(rightKey)
+	EndIf
+	If PYS_overrideToggleKey != -1
+		self.UnregisterForKey(PYS_overrideToggleKey)
+	EndIf
+
 	if runKey != -1
 		self.RegisterForKey(runKey)
 	endif
 	if autorunKey != -1
 		self.RegisterForKey(autorunKey)
+		if PYS_overrideToggleKey == -1
+			PYS_overrideToggleKey = autorunKey
+		endif
 	endif
 	if sneakKey != -1
 		self.RegisterForKey(sneakKey)
@@ -781,7 +809,9 @@ Function Initialize()
 	InitializeNativeSystem(PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist, PYS_InteriorWorldspacesFLST, PYS_WalledTownWorldspacesFLST, PYS_ExtraTownKeywordFLST, PYS_ExtraDunKeywordFLST)
 	
 	; Call this to see what's happening
-	TestNativeFunctions()
+	if firstRun
+		TestNativeFunctions()
+	endif
 	
 	if firstRun || ModName == "" 
 		LogMsg("Mod Initialized.")
@@ -790,17 +820,16 @@ Function Initialize()
 		LogMsg("Mod Reinitialized.")		
 	endif
 	
-	if autorunKey == -1
+	if autorunKey == -1 && !PYS_hasSMC && firstRun
 		LogMsg("Toggle Always Run key is unmapped.", false)
-		debug.MessageBox(self.ModName + ": Toggle Auto Run is not set.")
+		LogMsg("Toggle Always Run is not set.")
 		return
 	endif
 	
+	;self.RegisterForSingleUpdate(timeout)  -- We're gonna skip the update loop for now. I may do something later on.
 		
-	self.RegisterForSingleUpdate(timeout)
+endFunction
 	
-endfunction
-
 Function LogMsg(string aMsg, bool bPrint = true, bool bLogging = true) 
 				
 	if bLogging && PYS_detailLog
@@ -811,3 +840,5 @@ Function LogMsg(string aMsg, bool bPrint = true, bool bLogging = true)
 	endif
 
 endfunction
+
+

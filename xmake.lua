@@ -30,7 +30,10 @@ target("paceyourself-re")
         name = "paceyourself-re",
         author = "redrew89",
         description = "SKSE64 plugin to automatically manage player walk-run state based on location and MCM settings"
+       
     })
+    add_rules("mode.debug", "mode.release", "mode.releasedbg")
+
 
     -- add src files
     add_files("src/**.cpp")

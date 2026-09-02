@@ -120,41 +120,6 @@ Function UpdateNativeConfig(GlobalVariable PYS_Active, int combatRunSetting, boo
     MCM.LogMsg("Verification - walkInTownsUnwalled setting: " + GetCurrentConfig(2),false)
 EndFunction
 
-; Set the location marker for distance calculations
-Function UpdateLocationMarker(ObjectReference marker) Global
-    SetLocationMarker(marker)
-EndFunction
-
-; =======================
-; Backward Compatibility Functions
-; =======================
-
-; Drop-in replacement for your original ShouldRunHere function
-; Just calls the native version now
-bool Function ShouldRunHereCompat() Global
-    return ShouldRunHere()
-EndFunction
-
-; Main function that handles everything - replaces your Papyrus logic entirely
-; Returns the new movement state (true = running, false = walking)
-bool Function HandleMovementLogic() Global
-    return AutoSetPlayerMovement()
-EndFunction
-
-; =======================
-; Utility Functions
-; =======================
-
-; Get current movement mode (for compatibility with Game.GetPlayerMovementMode())
-bool Function GetPlayerMovementMode() Global
-    return GetPlayerWalkRunState()
-EndFunction
-
-; Force set movement state (direct wrapper)
-bool Function ForceMovementState(bool shouldRun) Global
-    return SetPlayerWalkRunState(shouldRun)
-EndFunction
-
 ; =======================
 ; Debug/Logging Functions
 ; =======================
@@ -211,19 +176,24 @@ Function CheckGamepad()	Global
 	
 	PYS_MCMScript MCM = Game.GetFormFromFile(2817, "PaceYourself.esp") as PYS_MCMScript
 	
-	if Game.UsingGamepad() && MCM.PYS_Active.GetValueInt() != 0
-		MCM.LogMsg("Gamepad detected. Shutting down. Restart without gamepad to resume.")
-		MCM.PlayerRef.RemoveSpell(MCM.PYS_TrackerSpell)
-		MCM.PYS_Active.SetValueInt(0)
-		MCM.PYS_globalToggle = false
-		MCM.ToggleModFlag(false)
-	elseif !Game.UsingGamepad() && MCM.PYS_Active.GetValueInt() == 0
+	if Game.UsingGamepad()		
+		MCM.LogMsg("Gamepad detected.")
+		if SKSE.GetPluginVersion("SkyrimMotionControl") != -1
+			MCM.LogMsg("SMC detected. Set gamepad walkstate in SMC Beta SKSE Menu Framework.")
+			MCM.PYS_hasSMC = true
+		else
+			MCM.LogMsg("Shutting down. Restart without gamepad to resume.")
+			;MCM.PlayerRef.RemoveSpell(MCM.PYS_TrackerSpell)
+			MCM.PYS_Active.SetValueInt(0)
+			MCM.PYS_globalToggle = false
+			MCM.ToggleModFlag(false)
+		endif
+	else
 		MCM.PYS_Active.SetValueInt(1)
 		MCM.PYS_globalToggle = true
 		MCM.ToggleModFlag(true)		
-		MCM.OnConfigInit()
 	endif
 
-	DebugMCMSettings(MCM.PYS_Active, MCM.PYS_combatRun, MCM.PYS_walkInTowns, MCM.PYS_walkInTownsUnwalled, MCM.PYS_walkInDungeons, MCM.PYS_maxDist)
+	UpdateNativeConfig(MCM.PYS_Active, MCM.PYS_combatRun, MCM.PYS_walkInTowns, MCM.PYS_walkInTownsUnwalled, MCM.PYS_walkInDungeons, MCM.PYS_maxDist)
 
 endFunction

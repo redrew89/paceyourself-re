@@ -7,15 +7,11 @@ PYS_MCMScript Property MCM Auto
 Actor Property PlayerRef Auto
 
 event OnPlayerLoadGame()
-
-	Utility.Wait(2) ; Let's give the Papyrus VM time to wake up before throwing key registrations at it.
+	Utility.Wait(2)
 	if MCM.firstRun
 		return ; Let the main initialization thread run
 	endif
-
 	MCM.Initialize()
-	MCM.ResetMarkerQuest()
-	
 endevent
 
 event OnInit()
@@ -33,4 +29,7 @@ Function SystemReset()
 		(MCM as Quest).Start()
 		
 endFunction
+
+
+
 
