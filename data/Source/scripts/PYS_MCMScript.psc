@@ -374,7 +374,8 @@ event OnOptionKeyMapChange(int option, int keyCode, string conflictControl, stri
 		if (continue)
 			PYS_overrideToggleKey = keyCode
 			SetKeymapOptionValue(option, keyCode)
-			RegisterForKey(PYS_overrideToggleKey)
+			; Inform native plugin of the remapped override key
+			PYS_UtilScript.SetNativeOverrideKey(PYS_overrideToggleKey)
 			LogMsg("Set override key: " + keyCode)
 		endIf
 	endIf
