@@ -4,6 +4,14 @@
 #include <unordered_set>
 #include <string>
 #include <format>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+#include <thread>
+#include <atomic>
+#include <Windows.h>
+#include <cstdlib>
 
 using namespace std::literals;
 
@@ -129,6 +137,127 @@ struct CachedForms {
 };
 
 CachedForms g_forms;
+
+// Override key state tracked natively
+int g_overrideKeyCode = -1;
+int g_runKeyCode = -1;
+bool g_playerOverride = false;
+
+// Input polling thread
+static std::thread g_inputThread;
+static std::atomic_bool g_inputThreadRunning{ false };
+
+// Set native key codes (called from Papyrus during initialize)
+void SetNativeOverrideKey(RE::StaticFunctionTag*, std::int32_t keyCode) {
+    g_overrideKeyCode = keyCode;
+    SKSE::log::info("SetNativeOverrideKey: {}", keyCode);
+}
+
+void SetNativeRunKey(RE::StaticFunctionTag*, std::int32_t keyCode) {
+    g_runKeyCode = keyCode;
+    SKSE::log::info("SetNativeRunKey: {}", keyCode);
+}
+
+// Handle override key press logic natively. Returns flags:
+// bit0 = player manually overrode (should show disable shader/msg),
+// bit1 = player choice aligns (should show enable shader/msg and reapply state),
+// bit2 = request to reapply current player state via SetPlayerWalkRunState
+int NativeMCM_HandleOverride(RE::StaticFunctionTag*, std::int32_t akKey) {
+    auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player) return 0;
+
+    bool isOverrideKey = (akKey == g_overrideKeyCode || akKey == g_runKeyCode);
+    if (!isOverrideKey) return 0;
+
+    // Determine current player movement mode and desired script mode
+    auto playerControls = RE::PlayerControls::GetSingleton();
+    if (!playerControls) return 0;
+
+    bool currentPlayerMode = playerControls->data.running;
+    bool setRun = ShouldRunHere(nullptr);
+
+    bool isOverridden = (currentPlayerMode != setRun);
+    g_playerOverride = isOverridden;
+
+    int flags = 0;
+    if (isOverridden) {
+        flags |= 1; // player overrode
+    } else {
+        flags |= 2; // player choice aligns
+        // When the override toggle key was used and player choice aligns, request reapply
+        flags |= 4;
+    }
+
+    return flags;
+}
+
+bool GetNativePlayerOverride(RE::StaticFunctionTag*) {
+    return g_playerOverride;
+}
+
+// Set native override flag from Papyrus (e.g., on keydown)
+void SetNativePlayerOverride(RE::StaticFunctionTag*, bool state) {
+    g_playerOverride = state;
+}
+
+// Poll keyboard state using Win32 - detects keydown/up transitions
+void InputPollingLoop() {
+    int prevOverrideState = 0;
+    int prevRunState = 0;
+    while (g_inputThreadRunning.load()) {
+        if (g_overrideKeyCode != -1) {
+            short state = GetAsyncKeyState(g_overrideKeyCode);
+            int pressed = (state & 0x8000) != 0;
+            if (pressed && !prevOverrideState) {
+                // keydown
+                SetNativePlayerOverride(nullptr, true);
+            }
+            if (!pressed && prevOverrideState) {
+                // keyup
+                int flags = NativeMCM_HandleOverride(nullptr, g_overrideKeyCode);
+                SetNativePlayerOverride(nullptr, (flags & 1) != 0);
+                // Send mod event to Papyrus to handle visuals
+                if (auto papyrus = SKSE::GetPapyrusInterface()) {
+                    papyrus->SendModEvent("PYS_NativeOverride", nullptr, static_cast<float>(flags));
+                }
+                // Apply movement decision immediately
+                AutoSetPlayerMovement(nullptr);
+            }
+            prevOverrideState = pressed;
+        }
+
+        if (g_runKeyCode != -1) {
+            short state = GetAsyncKeyState(g_runKeyCode);
+            int pressed = (state & 0x8000) != 0;
+            if (pressed && !prevRunState) {
+                // run key down
+                SetNativePlayerOverride(nullptr, true);
+            }
+            if (!pressed && prevRunState) {
+                // run key up
+                int flags = NativeMCM_HandleOverride(nullptr, g_runKeyCode);
+                SetNativePlayerOverride(nullptr, (flags & 1) != 0);
+                if (auto papyrus = SKSE::GetPapyrusInterface()) {
+                    papyrus->SendModEvent("PYS_NativeOverride", nullptr, static_cast<float>(flags));
+                }
+                AutoSetPlayerMovement(nullptr);
+            }
+            prevRunState = pressed;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+}
+
+// Gracefully stop the input polling thread
+void StopInputThread() {
+    if (!g_inputThreadRunning.load()) return;
+    g_inputThreadRunning.store(false);
+    if (g_inputThread.joinable()) {
+        g_inputThread.join();
+    }
+    SKSE::log::info("Input polling thread stopped");
+}
 
 // Helper function to ensure keywords are initialized when needed
 void EnsureKeywordsInitialized() {
@@ -544,6 +673,118 @@ bool RegisterPapyrusFunctions(RE::BSScript::IVirtualMachine* vm) {
     vm->RegisterFunction("LogCurrentLocation", "PYS_UtilScript", LogCurrentLocation);
     vm->RegisterFunction("GetCurrentConfig", "PYS_UtilScript", GetCurrentConfig);
 
+    // New location-tracking helpers
+    vm->RegisterFunction("GetPlayerLocationInfo", "PYS_UtilScript", GetPlayerLocationInfo);
+    vm->RegisterFunction("GetPlayerLocationName", "PYS_UtilScript", GetPlayerLocationName);
+        // Initialization helper to populate native caches from Papyrus FormLists
+        vm->RegisterFunction("InitializeNativeSystem", "PYS_UtilScript", InitializeNativeSystem);
+        // Debug / scaffold: dump native cached state to log (useful until serialization is wired)
+        vm->RegisterFunction("DumpNativeState", "PYS_UtilScript", DumpNativeState);
+
+    // Initialize native caches and configuration from Papyrus-provided data
+    void InitializeNativeSystem(RE::StaticFunctionTag*, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSFormList* interiorWorldspaces = nullptr, RE::BGSFormList* walledTownWorldspaces = nullptr, RE::BGSFormList* extraTownKeywords = nullptr, RE::BGSFormList* extraDunKeywords = nullptr) {
+        bool modActive = true;
+        if (PYS_Active) {
+            // TESGlobal stores a float value; treat non-zero as true
+            modActive = (PYS_Active->GetValue() != 0.0f);
+        }
+
+        SetMovementConfig(nullptr, modActive, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance);
+
+        // Populate interior worldspaces
+        if (interiorWorldspaces) {
+            std::uint32_t count = interiorWorldspaces->GetSize();
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto form = interiorWorldspaces->GetAt(i);
+                if (!form) continue;
+                auto ws = form->As<RE::TESWorldSpace>();
+                if (ws) AddInteriorWorldspace(nullptr, ws);
+            }
+        }
+
+        // Populate walled town worldspaces
+        if (walledTownWorldspaces) {
+            std::uint32_t count = walledTownWorldspaces->GetSize();
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto form = walledTownWorldspaces->GetAt(i);
+                if (!form) continue;
+                auto ws = form->As<RE::TESWorldSpace>();
+                if (ws) AddWalledTownWorldspace(nullptr, ws);
+            }
+        }
+
+        // Populate extra town keywords
+        if (extraTownKeywords) {
+            std::uint32_t count = extraTownKeywords->GetSize();
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto form = extraTownKeywords->GetAt(i);
+                if (!form) continue;
+                auto kw = form->As<RE::BGSKeyword>();
+                if (kw) AddExtraTownKeyword(nullptr, kw);
+            }
+        }
+
+        // Populate extra dungeon keywords
+        if (extraDunKeywords) {
+            std::uint32_t count = extraDunKeywords->GetSize();
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto form = extraDunKeywords->GetAt(i);
+                if (!form) continue;
+                auto kw = form->As<RE::BGSKeyword>();
+                if (kw) AddExtraDunKeyword(nullptr, kw);
+            }
+        }
+
+        SKSE::log::info("InitializeNativeSystem: populated native caches (interior/walled/extra keywords)");
+    }
+
+    // Debug helper to dump current native cached state to log (placeholder for serialization)
+    void DumpNativeState(RE::StaticFunctionTag*) {
+        SKSE::log::info("--- Dumping native cached state ---");
+
+        SKSE::log::info("Interior worldspaces: {} entries", g_forms.interiorWorldspaces.size());
+        for (auto id : g_forms.interiorWorldspaces) {
+            SKSE::log::info("  {:08X}", id);
+        }
+
+        SKSE::log::info("Walled town worldspaces: {} entries", g_forms.walledTownWorldspaces.size());
+        for (auto id : g_forms.walledTownWorldspaces) {
+            SKSE::log::info("  {:08X}", id);
+        }
+
+        SKSE::log::info("Extra town keywords: {} entries", g_forms.extraTownKeywords.size());
+        for (auto id : g_forms.extraTownKeywords) {
+            SKSE::log::info("  {:08X}", id);
+        }
+
+        SKSE::log::info("Extra dungeon keywords: {} entries", g_forms.extraDunKeywords.size());
+        for (auto id : g_forms.extraDunKeywords) {
+            SKSE::log::info("  {:08X}", id);
+        }
+
+        if (g_forms.locTypeCity) SKSE::log::info("LocTypeCity cached: {:08X}", g_forms.locTypeCity->GetFormID());
+        if (g_forms.locTypeTown) SKSE::log::info("LocTypeTown cached: {:08X}", g_forms.locTypeTown->GetFormID());
+        if (g_forms.locTypeClearable) SKSE::log::info("LocTypeClearable cached: {:08X}", g_forms.locTypeClearable->GetFormID());
+
+        if (g_forms.locationMarker) SKSE::log::info("Location marker ref cached: {:08X}", g_forms.locationMarker->GetFormID());
+
+        SKSE::log::info("--- End dump ---");
+    }
+    // Initialization helper to populate native caches from Papyrus FormLists
+    vm->RegisterFunction("InitializeNativeSystem", "PYS_UtilScript", InitializeNativeSystem);
+    // Debug / scaffold: dump native cached state to log (useful until serialization is wired)
+    vm->RegisterFunction("DumpNativeState", "PYS_UtilScript", DumpNativeState);
+    vm->RegisterFunction("SaveNativeCache", "PYS_UtilScript", SaveNativeCache);
+    vm->RegisterFunction("LoadNativeCache", "PYS_UtilScript", LoadNativeCache);
+    // MCM migration helpers
+    vm->RegisterFunction("NativeMCM_Initialize", "PYS_UtilScript", NativeMCM_Initialize);
+    vm->RegisterFunction("NativeMCM_SetRunState", "PYS_UtilScript", NativeMCM_SetRunState);
+    vm->RegisterFunction("SetNativeOverrideKey", "PYS_UtilScript", SetNativeOverrideKey);
+    vm->RegisterFunction("SetNativeRunKey", "PYS_UtilScript", SetNativeRunKey);
+    vm->RegisterFunction("NativeMCM_HandleOverride", "PYS_UtilScript", NativeMCM_HandleOverride);
+    vm->RegisterFunction("GetNativePlayerOverride", "PYS_UtilScript", GetNativePlayerOverride);
+    vm->RegisterFunction("SetNativePlayerOverride", "PYS_UtilScript", SetNativePlayerOverride);
+
     return true;
 }
 
@@ -562,5 +803,287 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     // Get Papyrus interface and register functions
     SKSE::GetPapyrusInterface()->Register(RegisterPapyrusFunctions);
 
+    // Load persisted native cache from disk (best-effort)
+    LoadNativeCacheFromDisk();
+
+    // Start input polling thread for native-only key handling
+    g_inputThreadRunning.store(true);
+    g_inputThread = std::thread([]() { InputPollingLoop(); });
+    // Ensure graceful shutdown on process exit
+    std::atexit(StopInputThread);
+
+    // Register SKSE serialization callbacks for co-save persistence
+    if (auto serialization = SKSE::GetSerializationInterface()) {
+        auto pluginHandle = SKSE::GetPluginHandle();
+        serialization->SetUniqueID(pluginHandle, 'PYSR');
+        serialization->SetSaveCallback(pluginHandle, [](auto ser) {
+            SKSE::log::info("Serialization SaveCallback invoked");
+            // Open a single record for our data
+            ser->OpenRecord('PYSR', 1);
+
+            // Write counts and formids for each set
+            auto writeSet = [&](const std::unordered_set<RE::FormID>& s) {
+                std::uint32_t count = static_cast<std::uint32_t>(s.size());
+                ser->WriteRecordData(&count, sizeof(count));
+                for (auto id : s) ser->WriteRecordData(&id, sizeof(id));
+            };
+
+            writeSet(g_forms.interiorWorldspaces);
+            writeSet(g_forms.walledTownWorldspaces);
+            writeSet(g_forms.extraTownKeywords);
+            writeSet(g_forms.extraDunKeywords);
+
+            // Marker ref
+            std::uint32_t markerID = g_forms.locationMarker ? g_forms.locationMarker->GetFormID() : 0;
+            ser->WriteRecordData(&markerID, sizeof(markerID));
+        });
+
+        serialization->SetLoadCallback(pluginHandle, [](auto ser) {
+            SKSE::log::info("Serialization LoadCallback invoked");
+            std::uint32_t type = 0, version = 0, length = 0;
+            while (ser->GetNextRecordInfo(&type, &version, &length)) {
+                if (type != 'PYSR') {
+                    // skip unknown records
+                    ser->ReadRecordData(nullptr, length);
+                    continue;
+                }
+
+                // Read four sets
+                auto readSet = [&](std::unordered_set<RE::FormID>& outSet) {
+                    std::uint32_t count = 0;
+                    ser->ReadRecordData(&count, sizeof(count));
+                    for (std::uint32_t i = 0; i < count; ++i) {
+                        std::uint32_t id = 0;
+                        ser->ReadRecordData(&id, sizeof(id));
+                        if (id) outSet.insert(id);
+                    }
+                };
+
+                g_forms.interiorWorldspaces.clear();
+                g_forms.walledTownWorldspaces.clear();
+                g_forms.extraTownKeywords.clear();
+                g_forms.extraDunKeywords.clear();
+
+                readSet(g_forms.interiorWorldspaces);
+                readSet(g_forms.walledTownWorldspaces);
+                readSet(g_forms.extraTownKeywords);
+                readSet(g_forms.extraDunKeywords);
+
+                // Marker
+                std::uint32_t markerID = 0;
+                ser->ReadRecordData(&markerID, sizeof(markerID));
+                if (markerID) {
+                    auto ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(markerID);
+                    if (ref) g_forms.locationMarker = ref;
+                }
+            }
+        });
+
+        serialization->SetRevertCallback(pluginHandle, [](auto) {
+            SKSE::log::info("Serialization RevertCallback invoked");
+            g_forms.interiorWorldspaces.clear();
+            g_forms.walledTownWorldspaces.clear();
+            g_forms.extraTownKeywords.clear();
+            g_forms.extraDunKeywords.clear();
+            g_forms.locationMarker = nullptr;
+        });
+    }
+
     return true;
 }
+
+// Bitmask flags returned by GetPlayerLocationInfo
+enum LocationFlags : int {
+    LF_None = 0,
+    LF_InInterior = 1 << 0,
+    LF_LocTypeCity = 1 << 1,
+    LF_LocTypeTown = 1 << 2,
+    LF_LocTypeClearable = 1 << 3,
+    LF_ExtraTown = 1 << 4,
+    LF_ExtraDun = 1 << 5,
+    LF_WalledTown = 1 << 6,
+    LF_WithinMarker = 1 << 7,
+    LF_NoLocation = 1 << 8
+};
+
+// Returns bitflags describing the player's current location state.
+int GetPlayerLocationInfo(RE::StaticFunctionTag*) {
+    auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player) return LF_None;
+
+    EnsureKeywordsInitialized();
+
+    auto currentLoc = player->GetCurrentLocation();
+    if (!currentLoc) {
+        return LF_NoLocation;
+    }
+
+    int flags = LF_None;
+
+    if (IsInInteriorActual(player)) flags |= LF_InInterior;
+
+    if (g_forms.locTypeCity && currentLoc->HasKeyword(g_forms.locTypeCity)) flags |= LF_LocTypeCity;
+    if (g_forms.locTypeTown && currentLoc->HasKeyword(g_forms.locTypeTown)) flags |= LF_LocTypeTown;
+    if (g_forms.locTypeClearable && currentLoc->HasKeyword(g_forms.locTypeClearable)) flags |= LF_LocTypeClearable;
+
+    if (CheckAdditionalKeywords(g_forms.extraTownKeywords, currentLoc)) flags |= LF_ExtraTown;
+    if (CheckAdditionalKeywords(g_forms.extraDunKeywords, currentLoc)) flags |= LF_ExtraDun;
+
+    auto currentWorld = player->GetWorldspace();
+    if (currentWorld && g_forms.walledTownWorldspaces.count(currentWorld->GetFormID())) flags |= LF_WalledTown;
+
+    if (g_forms.locationMarker) {
+        float distanceFromMarker = g_forms.locationMarker->GetDistance(player);
+        if (distanceFromMarker <= g_config.maxDist) flags |= LF_WithinMarker;
+    }
+
+    return flags;
+}
+
+// Returns the current location name or an empty string if none (wilderness)
+std::string GetPlayerLocationName(RE::StaticFunctionTag*) {
+    auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player) return std::string();
+
+    auto currentLoc = player->GetCurrentLocation();
+    if (!currentLoc) return std::string();
+
+    auto name = currentLoc->GetName();
+    return name ? std::string(name) : std::string();
+}
+
+// Native helper to be called from MCM initialize. Populates native caches and runs quick tests.
+void NativeMCM_Initialize(RE::StaticFunctionTag*, RE::Actor* PlayerRef, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSFormList* interiorWorldspaces = nullptr, RE::BGSFormList* walledTownWorldspaces = nullptr, RE::BGSFormList* extraTownKeywords = nullptr, RE::BGSFormList* extraDunKeywords = nullptr) {
+    SKSE::log::info("NativeMCM_Initialize called");
+    // Populate config and caches
+    InitializeNativeSystem(nullptr, PYS_Active, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance, interiorWorldspaces, walledTownWorldspaces, extraTownKeywords, extraDunKeywords);
+
+    // Optionally set player reference marker or other initial state
+    if (PlayerRef) {
+        g_forms.locationMarker = nullptr; // safe default; actual marker set via SetLocationMarker
+    }
+
+    // Run native tests once for debugging
+    TestNativeFunctions();
+}
+
+// Simple native wrapper invoked by MCM SetRunState to perform decision + application of run/walk state.
+// Returns the applied run state (true = running, false = walking)
+// Action flags returned to Papyrus
+static constexpr std::uint32_t NMS_NONE = 0;
+static constexpr std::uint32_t NMS_CHANGED_TO_RUN = 1 << 0;
+static constexpr std::uint32_t NMS_CHANGED_TO_WALK = 1 << 1;
+static constexpr std::uint32_t NMS_COOLDOWN = 1 << 2;
+
+int NativeMCM_SetRunState(RE::StaticFunctionTag*, RE::Actor* akActor, bool playerOverride, bool inputRunPressed, float timeout) {
+    if (!akActor) return NMS_NONE;
+    auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player) return NMS_NONE;
+
+    if (akActor != player) return NMS_NONE;
+
+    // If player override or input pressed, let Papyrus handle scheduling and skip
+    if (playerOverride || inputRunPressed) {
+        return NMS_NONE;
+    }
+
+    // If sneaking, skip changes
+    if (player->IsSneaking()) {
+        return NMS_NONE;
+    }
+
+    // Cooldown check (use steady_clock)
+    static auto lastToggle = std::chrono::steady_clock::time_point::min();
+    auto now = std::chrono::steady_clock::now();
+    float cooldownPeriod = timeout / 4.0f;
+    if (lastToggle != std::chrono::steady_clock::time_point::min()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::duration<float>>(now - lastToggle).count();
+        if (elapsed < cooldownPeriod) {
+            return NMS_COOLDOWN;
+        }
+    }
+
+    // Record previous state
+    auto playerControls = RE::PlayerControls::GetSingleton();
+    if (!playerControls) return NMS_NONE;
+    bool prevState = playerControls->data.running;
+
+    // Make decision and apply
+    bool newState = AutoSetPlayerMovement(nullptr);
+
+    if (newState != prevState) {
+        lastToggle = now;
+        return newState ? NMS_CHANGED_TO_RUN : NMS_CHANGED_TO_WALK;
+    }
+
+    return NMS_NONE;
+}
+
+static constexpr const char* kNativeCacheFile = "Data/PaceYourself_NativeCache.txt";
+
+// Simple disk-based persistence (fallback to SKSE save integration later)
+void SaveNativeCacheToDisk() {
+    std::ofstream out(kNativeCacheFile, std::ios::trunc);
+    if (!out) {
+        SKSE::log::warn("SaveNativeCacheToDisk: failed to open {}", kNativeCacheFile);
+        return;
+    }
+
+    auto writeSet = [&](const char* label, const std::unordered_set<RE::FormID>& s) {
+        out << label << '\n';
+        for (auto id : s) out << std::hex << std::setw(8) << std::setfill('0') << id << '\n';
+    };
+
+    writeSet("INTERIORS", g_forms.interiorWorldspaces);
+    writeSet("WALLED", g_forms.walledTownWorldspaces);
+    writeSet("EXTRA_TOWN_KW", g_forms.extraTownKeywords);
+    writeSet("EXTRA_DUN_KW", g_forms.extraDunKeywords);
+
+    if (g_forms.locationMarker) {
+        out << "MARKER\n" << std::hex << std::setw(8) << std::setfill('0') << g_forms.locationMarker->GetFormID() << '\n';
+    }
+
+    out.close();
+    SKSE::log::info("Saved native cache to {}", kNativeCacheFile);
+}
+
+void LoadNativeCacheFromDisk() {
+    std::ifstream in(kNativeCacheFile);
+    if (!in) {
+        SKSE::log::info("No native cache file found: {}", kNativeCacheFile);
+        return;
+    }
+
+    std::string line;
+    std::string section;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line == "INTERIORS" || line == "WALLED" || line == "EXTRA_TOWN_KW" || line == "EXTRA_DUN_KW" || line == "MARKER") {
+            section = line;
+            continue;
+        }
+
+        // Parse hex formid
+        std::uint32_t id = 0;
+        std::stringstream ss;
+        ss << std::hex << line;
+        ss >> id;
+        if (id == 0) continue;
+
+        if (section == "INTERIORS") g_forms.interiorWorldspaces.insert(id);
+        else if (section == "WALLED") g_forms.walledTownWorldspaces.insert(id);
+        else if (section == "EXTRA_TOWN_KW") g_forms.extraTownKeywords.insert(id);
+        else if (section == "EXTRA_DUN_KW") g_forms.extraDunKeywords.insert(id);
+        else if (section == "MARKER") {
+            auto ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+            if (ref) g_forms.locationMarker = ref;
+        }
+    }
+
+    in.close();
+    SKSE::log::info("Loaded native cache from {}", kNativeCacheFile);
+}
+
+// Papyrus-exposed save/load for debugging
+void SaveNativeCache(RE::StaticFunctionTag*) { SaveNativeCacheToDisk(); }
+void LoadNativeCache(RE::StaticFunctionTag*) { LoadNativeCacheFromDisk(); }

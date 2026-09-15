@@ -36,6 +36,20 @@ bool Function GetCurrentConfig(int configType) Global Native
 ; Helper Functions for Papyrus Compatibility
 ; =======================
 
+; --- MCM migration native helpers ---
+Function NativeMCM_Initialize(Actor PlayerRef, GlobalVariable PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, FormList interiorWorldspaces = None, FormList walledTownWorldspaces = None, FormList extraTownKeywords = None, FormList extraDunKeywords = None) Global Native
+
+int Function NativeMCM_SetRunState(Actor akActor, bool playerOverride, bool inputRunPressed, float timeout) Global Native
+
+; Native override helpers
+Function SetNativeOverrideKey(int keyCode) Global Native
+Function SetNativeRunKey(int keyCode) Global Native
+int Function NativeMCM_HandleOverride(int akKey) Global Native
+ 
+bool Function GetNativePlayerOverride() Global Native
+Function SetNativePlayerOverride(bool state) Global Native
+
+
 ; Initialize the native system with form lists (call this during mod startup)
 Function InitializeNativeSystem(GlobalVariable PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, FormList interiorWorldspaces = None, FormList walledTownWorldspaces = None, FormList extraTownKeywords = None, FormList extraDunKeywords = None) Global
     

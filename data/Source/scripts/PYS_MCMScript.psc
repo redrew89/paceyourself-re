@@ -46,7 +46,7 @@ bool Property PYS_walkInDungeons = false Auto conditional
 bool Property PYS_globalToggle = true Auto conditional
 bool Property PYS_walkInTownsUnwalled = false Auto conditional
 
-bool Property PYS_playerOverride = false Auto
+; PYS_playerOverride is now managed natively by the SKSE plugin
 bool Property PYS_simulatedKeyPress = false auto conditional
 bool Property PYS_detailLog = true auto conditional
 bool Property PYS_msgVerbose = true auto conditional
@@ -546,139 +546,91 @@ Event OnUpdate()
 	
 endEvent
 
-Event OnKeyDown(int akKey)
-	
-	if Utility.IsInMenuMode()
-		;Discard input, player is in menu
-		LogMsg("Ignoring input while menu is open.",false)
-		return
-	endif
-		
-	if akKey == runKey 
-		PYS_playerOverride = true
-	endif
-		
-endevent
-
-Event OnKeyUp(int akKey, float holdTime)
-	
-	if Utility.IsInMenuMode()
-		;Discard input, player is in menu
-		LogMsg("Ignoring input while menu is open.",false)
-		return
-	endif
-	
-	if akKey == PYS_overrideToggleKey || akKey == autorunKey
-		PYS_playerOverride = true
-		SetOverride(akKey)
-	endif
-		
-endEvent
+; Key handling moved to native plugin (input polling thread)
 
 
 Function SetRunState(Actor akActor)
-
+endFunction
 	; Early validation
 	if akActor != PlayerRef
 		LogMsg("Invalid actor - skipping", false)
 		return
 	endif
-	
-	if self.PYS_playerOverride || Input.IsKeyPressed(runKey)
-		LogMsg("Player override active - bypassing", false)
-		self.RegisterForSingleUpdate(PYS_refreshTime)
-		return
-	endif
-	
-	; Cache frequently used values
-	bool currentRunState = Game.GetPlayerMovementMode()
-	bool targetRunState = ShouldRunHere()
-	
-	; Early exit if no change needed or player is sneaking
-	if akActor.IsSneaking() || (targetRunState == currentRunState)
-		self.RegisterForSingleUpdate(refreshTime)
-		return
-	endif
-	
-	; Cooldown check
-	float currentTime = Utility.GetCurrentRealTime()
-	float cooldownPeriod = PYS_timeout / 4
-	if (currentTime - lastToggleTime) < cooldownPeriod  && !PlayerRef.GetCombatState() == 0 && !PlayerRef.IsWeaponDrawn() ; Adding checks for combat and weapon states, to skip cooldown.
+
+	; Pass override / input state to native and let it decide
+	bool inputPressed = Input.IsKeyPressed(runKey)
+	int action = PYS_UtilScript.NativeMCM_SetRunState(akActor, PYS_UtilScript.GetNativePlayerOverride(), inputPressed, PYS_timeout)
+
+	; Handle cooldown special-case
+	if (action & 4) != 0
 		LogMsg("Cooldown active - deferring toggle", false)
 		self.RegisterForSingleUpdate(PYS_timeout/2)
 		return
 	endif
-	lastToggleTime = currentTime
-	
-	if PYS_shaderFX != 0
-		MuffleFXShader_PYSChangeIndicator.Play(akActor,1)
+
+	; If no change, schedule refresh and exit
+	if action == 0
+		self.RegisterForSingleUpdate(refreshTime)
+		return
 	endif
-	
+
+	; Play change indicator shader when changes occurred
+	if (action & 1) != 0 || (action & 2) != 0
+		if PYS_shaderFX != 0
+			MuffleFXShader_PYSChangeIndicator.Play(akActor,1)
+		endif
+	endif
+
+	; Show messages per action (Run/Walk)
 	if PYS_msgVerbose
-		if targetRunState
+		if (action & 1) != 0
 			PYS_RunMsg.Show()
-		else
+		elseif (action & 2) != 0
 			PYS_WalkMsg.Show()
 		endif
 	endif
-	
-	; Perform the actual movement state change
-	AutoSetPlayerMovement()
-	
+
 	; Schedule next update
 	self.RegisterForSingleUpdate(refreshTime)
-	
+
 endFunction
 
 Function SetOverride(int aKey = -1)
 
-	LogMsg("Setting player override in response to Keypress.",false)
-	
-	; Player manually toggled autorun with override key - set override logic
-	currentPlayerMode = Game.GetPlayerMovementMode()
-	
-	bool setRun = ShouldRunHere() 
-	
-	LogMsg("simulated key press: " + self.PYS_simulatedKeyPress, false)
-	LogMsg("Player toggle matches script: " + (currentPlayerMode == setRun), false)
-	bool isOverridden = currentPlayerMode != setRun
-		
-	
-	if isOverridden ; Set override if player's choice conflicts with script preference
-	
-		self.PYS_playerOverride = isOverridden			
+	LogMsg("Setting player override in response to Keypress.", false)
+
+	int flags = PYS_UtilScript.NativeMCM_HandleOverride(aKey)
+	PYS_UtilScript.SetNativePlayerOverride((flags & 1) != 0)
+
+	if (flags & 4) != 0
+		bool currentPlayerMode = Game.GetPlayerMovementMode()
+		SetPlayerWalkRunState(currentPlayerMode)
+	endif
+
+	if (flags & 1) != 0
 		if PYS_shaderFX == 1
-			MuffleFXShader_PYSDisable.Play(PlayerRef,2)			
+			MuffleFXShader_PYSDisable.Play(PlayerRef,2)
 		elseif PYS_shaderFX == 2
-			MuffleFXShader_PYSDisableAlt.Play(PlayerRef,2)			
+			MuffleFXShader_PYSDisableAlt.Play(PlayerRef,2)
 		elseif PYS_shaderFX == 3
-			MuffleFXShader_PYSDisableAlt2.Play(PlayerRef,2)			
+			MuffleFXShader_PYSDisableAlt2.Play(PlayerRef,2)
 		endif
-		
 		LogMsg("Player manually overrode script preference", false)
 		if PYS_msgVerbose
 			PYS_PauseMsg.Show()
 		endif
-		
-	else ;Disable override if player's choice matches with script preference
-		self.PYS_playerOverride = isOverridden
-		
+	else
 		if PYS_shaderFX == 1
-			MuffleFXShader_PYSEnable.Play(PlayerRef,2)			
+			MuffleFXShader_PYSEnable.Play(PlayerRef,2)
 		elseif PYS_shaderFX == 2
-			MuffleFXShader_PYSEnableAlt.Play(PlayerRef,2)			
+			MuffleFXShader_PYSEnableAlt.Play(PlayerRef,2)
 		elseif PYS_shaderFX == 3
-			MuffleFXShader_PYSEnableAlt2.Play(PlayerRef,2)			
-		endif				
-	
+			MuffleFXShader_PYSEnableAlt2.Play(PlayerRef,2)
+		endif
 		LogMsg("Player choice aligns with script preference", false)
 		if PYS_msgVerbose
 			PYS_ResumeMsg.Show()
 		endif
-	endif
-	
-	if aKey == PYS_overrideToggleKey 
-		SetPlayerWalkRunState(currentPlayerMode)
 	endif
 
 endfunction
@@ -730,64 +682,25 @@ Function Initialize()
 	backKey = Input.GetMappedKey("Back")
 	leftKey = Input.GetMappedKey("Strafe Left")
 	rightKey = Input.GetMappedKey("Strafe Right")
+
+	; Set sensible defaults if mappings are unset
+	if autorunKey == -1
+		autorunKey = 20 ; CAPS LOCK
+	endif
+	if runKey == -1
+		runKey = 161 ; RIGHT SHIFT
+	endif
+	if PYS_overrideToggleKey == -1
+		PYS_overrideToggleKey = autorunKey
+	endif
 	
 
-	; --- unregister previous bindings before re-registering, so repeat
-	; Initialize() calls (toggle mod, remap key) don't accumulate duplicate
-	; registrations on the same key ---
-	If runKey != -1
-		self.UnregisterForKey(runKey)
-	EndIf
-	If autorunKey != -1
-		self.UnregisterForKey(autorunKey)
-	EndIf
-	If sneakKey != -1
-		self.UnregisterForKey(sneakKey)
-	EndIf
-	If forwardKey != -1
-		self.UnregisterForKey(forwardKey)
-	EndIf
-	If backKey != -1
-		self.UnregisterForKey(backKey)
-	EndIf
-	If leftKey != -1
-		self.UnregisterForKey(leftKey)
-	EndIf
-	If rightKey != -1
-		self.UnregisterForKey(rightKey)
-	EndIf
-	If PYS_overrideToggleKey != -1
-		self.UnregisterForKey(PYS_overrideToggleKey)
-	EndIf
-
-	if runKey != -1
-		self.RegisterForKey(runKey)
-	endif
-	if autorunKey != -1
-		self.RegisterForKey(autorunKey)
-		if PYS_overrideToggleKey == -1
-			PYS_overrideToggleKey = autorunKey
-		endif
-	endif
-	if sneakKey != -1
-		self.RegisterForKey(sneakKey)
-	endif
-	if forwardKey != -1
-		self.RegisterForKey(forwardKey)
-	endif
-	if backKey != -1
-		self.RegisterForKey(backKey)
-	endif
-	if leftKey != -1
-		self.RegisterForKey(leftKey)
-	endif
-	if rightKey != -1
-		self.RegisterForKey(rightKey)
-	endif
-	if PYS_overrideToggleKey != -1
-		self.RegisterForKey(PYS_overrideToggleKey)
-	endif
+	; Key registration handled natively by the SKSE plugin (input polling thread)
 		
+	; Inform native plugin of chosen keys
+	PYS_UtilScript.SetNativeOverrideKey(PYS_overrideToggleKey)
+	PYS_UtilScript.SetNativeRunKey(runKey)
+
 	ResetMarkerQuest()
 	
 	if PYS_detailLog
@@ -806,7 +719,11 @@ Function Initialize()
 		endwhile	
 	endif
 	
-	InitializeNativeSystem(PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist, PYS_InteriorWorldspacesFLST, PYS_WalledTownWorldspacesFLST, PYS_ExtraTownKeywordFLST, PYS_ExtraDunKeywordFLST)
+	; Delegate native cache population and initialization to the plugin
+	PYS_UtilScript.NativeMCM_Initialize(PlayerRef, PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist, PYS_InteriorWorldspacesFLST, PYS_WalledTownWorldspacesFLST, PYS_ExtraTownKeywordFLST, PYS_ExtraDunKeywordFLST)
+
+	; Register for native override mod events for immediate visuals
+	RegisterForModEvent("PYS_NativeOverride", "OnNativeOverride")
 	
 	; Call this to see what's happening
 	if firstRun
@@ -829,6 +746,37 @@ Function Initialize()
 	;self.RegisterForSingleUpdate(timeout)  -- We're gonna skip the update loop for now. I may do something later on.
 		
 endFunction
+
+Event OnNativeOverride(string eventName, string strArg, float numArg, Form akSender)
+	int flags = numArg as Int
+
+	; Play shaders/messages according to native flags (Papyrus handles visuals)
+	if (flags & 1) != 0
+		if PYS_shaderFX == 1
+			MuffleFXShader_PYSDisable.Play(PlayerRef,2)
+		elseif PYS_shaderFX == 2
+			MuffleFXShader_PYSDisableAlt.Play(PlayerRef,2)
+		elseif PYS_shaderFX == 3
+			MuffleFXShader_PYSDisableAlt2.Play(PlayerRef,2)
+		endif
+		LogMsg("Player manually overrode script preference", false)
+		if PYS_msgVerbose
+			PYS_PauseMsg.Show()
+		endif
+	else
+		if PYS_shaderFX == 1
+			MuffleFXShader_PYSEnable.Play(PlayerRef,2)
+		elseif PYS_shaderFX == 2
+			MuffleFXShader_PYSEnableAlt.Play(PlayerRef,2)
+		elseif PYS_shaderFX == 3
+			MuffleFXShader_PYSEnableAlt2.Play(PlayerRef,2)
+		endif
+		LogMsg("Player choice aligns with script preference", false)
+		if PYS_msgVerbose
+			PYS_ResumeMsg.Show()
+		endif
+	endif
+EndEvent
 	
 Function LogMsg(string aMsg, bool bPrint = true, bool bLogging = true) 
 				
