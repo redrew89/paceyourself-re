@@ -722,8 +722,8 @@ Function Initialize()
 	; Delegate native cache population and initialization to the plugin
 	PYS_UtilScript.NativeMCM_Initialize(PlayerRef, PYS_Active, PYS_combatRun, PYS_walkInTowns, PYS_walkInTownsUnwalled, PYS_walkInDungeons, PYS_maxDist, PYS_InteriorWorldspacesFLST, PYS_WalledTownWorldspacesFLST, PYS_ExtraTownKeywordFLST, PYS_ExtraDunKeywordFLST)
 
-	; Register for native override mod events for immediate visuals
-	RegisterForModEvent("PYS_NativeOverride", "OnNativeOverride")
+	; Register for native key events (sent by native input thread)
+	RegisterForModEvent("PYS_NativeKey", "OnNativeKey")
 	
 	; Call this to see what's happening
 	if firstRun
@@ -747,33 +747,49 @@ Function Initialize()
 		
 endFunction
 
-Event OnNativeOverride(string eventName, string strArg, float numArg, Form akSender)
-	int flags = numArg as Int
+Event OnNativeKey(string eventName, string strArg, float numArg, Form akSender)
+	int keyCode = numArg as Int
 
-	; Play shaders/messages according to native flags (Papyrus handles visuals)
-	if (flags & 1) != 0
-		if PYS_shaderFX == 1
-			MuffleFXShader_PYSDisable.Play(PlayerRef,2)
-		elseif PYS_shaderFX == 2
-			MuffleFXShader_PYSDisableAlt.Play(PlayerRef,2)
-		elseif PYS_shaderFX == 3
-			MuffleFXShader_PYSDisableAlt2.Play(PlayerRef,2)
+	if strArg == "down"
+		; Key down: set native override flag
+		PYS_UtilScript.SetNativePlayerOverride(true)
+		return
+	endif
+
+	if strArg == "up"
+		int flags = PYS_UtilScript.NativeMCM_HandleOverride(keyCode)
+		PYS_UtilScript.SetNativePlayerOverride((flags & 1) != 0)
+
+		if (flags & 4) != 0
+			bool currentPlayerMode = Game.GetPlayerMovementMode()
+			SetPlayerWalkRunState(currentPlayerMode)
 		endif
-		LogMsg("Player manually overrode script preference", false)
-		if PYS_msgVerbose
-			PYS_PauseMsg.Show()
-		endif
-	else
-		if PYS_shaderFX == 1
-			MuffleFXShader_PYSEnable.Play(PlayerRef,2)
-		elseif PYS_shaderFX == 2
-			MuffleFXShader_PYSEnableAlt.Play(PlayerRef,2)
-		elseif PYS_shaderFX == 3
-			MuffleFXShader_PYSEnableAlt2.Play(PlayerRef,2)
-		endif
-		LogMsg("Player choice aligns with script preference", false)
-		if PYS_msgVerbose
-			PYS_ResumeMsg.Show()
+
+		; Play shaders/messages according to native flags (Papyrus handles visuals)
+		if (flags & 1) != 0
+			if PYS_shaderFX == 1
+				MuffleFXShader_PYSDisable.Play(PlayerRef,2)
+			elseif PYS_shaderFX == 2
+				MuffleFXShader_PYSDisableAlt.Play(PlayerRef,2)
+			elseif PYS_shaderFX == 3
+				MuffleFXShader_PYSDisableAlt2.Play(PlayerRef,2)
+			endif
+			LogMsg("Player manually overrode script preference", false)
+			if PYS_msgVerbose
+				PYS_PauseMsg.Show()
+			endif
+		else
+			if PYS_shaderFX == 1
+				MuffleFXShader_PYSEnable.Play(PlayerRef,2)
+			elseif PYS_shaderFX == 2
+				MuffleFXShader_PYSEnableAlt.Play(PlayerRef,2)
+			elseif PYS_shaderFX == 3
+				MuffleFXShader_PYSEnableAlt2.Play(PlayerRef,2)
+			endif
+			LogMsg("Player choice aligns with script preference", false)
+			if PYS_msgVerbose
+				PYS_ResumeMsg.Show()
+			endif
 		endif
 	endif
 EndEvent

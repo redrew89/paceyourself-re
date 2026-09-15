@@ -209,19 +209,17 @@ void InputPollingLoop() {
             short state = GetAsyncKeyState(g_overrideKeyCode);
             int pressed = (state & 0x8000) != 0;
             if (pressed && !prevOverrideState) {
-                // keydown
-                SetNativePlayerOverride(nullptr, true);
+                // keydown - notify Papyrus to set override state on main thread
+                if (auto papyrus = SKSE::GetPapyrusInterface()) {
+                    papyrus->SendModEvent("PYS_NativeKey", "down", static_cast<float>(g_overrideKeyCode));
+                }
             }
             if (!pressed && prevOverrideState) {
                 // keyup
-                int flags = NativeMCM_HandleOverride(nullptr, g_overrideKeyCode);
-                SetNativePlayerOverride(nullptr, (flags & 1) != 0);
-                // Send mod event to Papyrus to handle visuals
+                // Send key-up mod event to Papyrus (main thread will handle game logic)
                 if (auto papyrus = SKSE::GetPapyrusInterface()) {
-                    papyrus->SendModEvent("PYS_NativeOverride", nullptr, static_cast<float>(flags));
+                    papyrus->SendModEvent("PYS_NativeKey", "up", static_cast<float>(g_overrideKeyCode));
                 }
-                // Apply movement decision immediately
-                AutoSetPlayerMovement(nullptr);
             }
             prevOverrideState = pressed;
         }
@@ -230,17 +228,17 @@ void InputPollingLoop() {
             short state = GetAsyncKeyState(g_runKeyCode);
             int pressed = (state & 0x8000) != 0;
             if (pressed && !prevRunState) {
-                // run key down
-                SetNativePlayerOverride(nullptr, true);
+                // run key down - notify Papyrus
+                if (auto papyrus = SKSE::GetPapyrusInterface()) {
+                    papyrus->SendModEvent("PYS_NativeKey", "down", static_cast<float>(g_runKeyCode));
+                }
             }
             if (!pressed && prevRunState) {
                 // run key up
-                int flags = NativeMCM_HandleOverride(nullptr, g_runKeyCode);
-                SetNativePlayerOverride(nullptr, (flags & 1) != 0);
                 if (auto papyrus = SKSE::GetPapyrusInterface()) {
-                    papyrus->SendModEvent("PYS_NativeOverride", nullptr, static_cast<float>(flags));
+                    papyrus->SendModEvent("PYS_NativeKey", "up", static_cast<float>(g_runKeyCode));
                 }
-                AutoSetPlayerMovement(nullptr);
+                // Request immediate movement evaluation via Papyrus/script if needed
             }
             prevRunState = pressed;
         }
@@ -681,95 +679,6 @@ bool RegisterPapyrusFunctions(RE::BSScript::IVirtualMachine* vm) {
         // Debug / scaffold: dump native cached state to log (useful until serialization is wired)
         vm->RegisterFunction("DumpNativeState", "PYS_UtilScript", DumpNativeState);
 
-    // Initialize native caches and configuration from Papyrus-provided data
-    void InitializeNativeSystem(RE::StaticFunctionTag*, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSFormList* interiorWorldspaces = nullptr, RE::BGSFormList* walledTownWorldspaces = nullptr, RE::BGSFormList* extraTownKeywords = nullptr, RE::BGSFormList* extraDunKeywords = nullptr) {
-        bool modActive = true;
-        if (PYS_Active) {
-            // TESGlobal stores a float value; treat non-zero as true
-            modActive = (PYS_Active->GetValue() != 0.0f);
-        }
-
-        SetMovementConfig(nullptr, modActive, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance);
-
-        // Populate interior worldspaces
-        if (interiorWorldspaces) {
-            std::uint32_t count = interiorWorldspaces->GetSize();
-            for (std::uint32_t i = 0; i < count; ++i) {
-                auto form = interiorWorldspaces->GetAt(i);
-                if (!form) continue;
-                auto ws = form->As<RE::TESWorldSpace>();
-                if (ws) AddInteriorWorldspace(nullptr, ws);
-            }
-        }
-
-        // Populate walled town worldspaces
-        if (walledTownWorldspaces) {
-            std::uint32_t count = walledTownWorldspaces->GetSize();
-            for (std::uint32_t i = 0; i < count; ++i) {
-                auto form = walledTownWorldspaces->GetAt(i);
-                if (!form) continue;
-                auto ws = form->As<RE::TESWorldSpace>();
-                if (ws) AddWalledTownWorldspace(nullptr, ws);
-            }
-        }
-
-        // Populate extra town keywords
-        if (extraTownKeywords) {
-            std::uint32_t count = extraTownKeywords->GetSize();
-            for (std::uint32_t i = 0; i < count; ++i) {
-                auto form = extraTownKeywords->GetAt(i);
-                if (!form) continue;
-                auto kw = form->As<RE::BGSKeyword>();
-                if (kw) AddExtraTownKeyword(nullptr, kw);
-            }
-        }
-
-        // Populate extra dungeon keywords
-        if (extraDunKeywords) {
-            std::uint32_t count = extraDunKeywords->GetSize();
-            for (std::uint32_t i = 0; i < count; ++i) {
-                auto form = extraDunKeywords->GetAt(i);
-                if (!form) continue;
-                auto kw = form->As<RE::BGSKeyword>();
-                if (kw) AddExtraDunKeyword(nullptr, kw);
-            }
-        }
-
-        SKSE::log::info("InitializeNativeSystem: populated native caches (interior/walled/extra keywords)");
-    }
-
-    // Debug helper to dump current native cached state to log (placeholder for serialization)
-    void DumpNativeState(RE::StaticFunctionTag*) {
-        SKSE::log::info("--- Dumping native cached state ---");
-
-        SKSE::log::info("Interior worldspaces: {} entries", g_forms.interiorWorldspaces.size());
-        for (auto id : g_forms.interiorWorldspaces) {
-            SKSE::log::info("  {:08X}", id);
-        }
-
-        SKSE::log::info("Walled town worldspaces: {} entries", g_forms.walledTownWorldspaces.size());
-        for (auto id : g_forms.walledTownWorldspaces) {
-            SKSE::log::info("  {:08X}", id);
-        }
-
-        SKSE::log::info("Extra town keywords: {} entries", g_forms.extraTownKeywords.size());
-        for (auto id : g_forms.extraTownKeywords) {
-            SKSE::log::info("  {:08X}", id);
-        }
-
-        SKSE::log::info("Extra dungeon keywords: {} entries", g_forms.extraDunKeywords.size());
-        for (auto id : g_forms.extraDunKeywords) {
-            SKSE::log::info("  {:08X}", id);
-        }
-
-        if (g_forms.locTypeCity) SKSE::log::info("LocTypeCity cached: {:08X}", g_forms.locTypeCity->GetFormID());
-        if (g_forms.locTypeTown) SKSE::log::info("LocTypeTown cached: {:08X}", g_forms.locTypeTown->GetFormID());
-        if (g_forms.locTypeClearable) SKSE::log::info("LocTypeClearable cached: {:08X}", g_forms.locTypeClearable->GetFormID());
-
-        if (g_forms.locationMarker) SKSE::log::info("Location marker ref cached: {:08X}", g_forms.locationMarker->GetFormID());
-
-        SKSE::log::info("--- End dump ---");
-    }
     // Initialization helper to populate native caches from Papyrus FormLists
     vm->RegisterFunction("InitializeNativeSystem", "PYS_UtilScript", InitializeNativeSystem);
     // Debug / scaffold: dump native cached state to log (useful until serialization is wired)
@@ -950,6 +859,96 @@ std::string GetPlayerLocationName(RE::StaticFunctionTag*) {
 
     auto name = currentLoc->GetName();
     return name ? std::string(name) : std::string();
+}
+
+// Initialization helper to populate native caches from Papyrus FormLists
+void InitializeNativeSystem(RE::StaticFunctionTag*, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSFormList* interiorWorldspaces = nullptr, RE::BGSFormList* walledTownWorldspaces = nullptr, RE::BGSFormList* extraTownKeywords = nullptr, RE::BGSFormList* extraDunKeywords = nullptr) {
+    bool modActive = true;
+    if (PYS_Active) {
+        // TESGlobal stores a float value; treat non-zero as true
+        modActive = (PYS_Active->GetValue() != 0.0f);
+    }
+
+    SetMovementConfig(nullptr, modActive, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance);
+
+    // Populate interior worldspaces
+    if (interiorWorldspaces) {
+        std::uint32_t count = interiorWorldspaces->GetSize();
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto form = interiorWorldspaces->GetAt(i);
+            if (!form) continue;
+            auto ws = form->As<RE::TESWorldSpace>();
+            if (ws) AddInteriorWorldspace(nullptr, ws);
+        }
+    }
+
+    // Populate walled town worldspaces
+    if (walledTownWorldspaces) {
+        std::uint32_t count = walledTownWorldspaces->GetSize();
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto form = walledTownWorldspaces->GetAt(i);
+            if (!form) continue;
+            auto ws = form->As<RE::TESWorldSpace>();
+            if (ws) AddWalledTownWorldspace(nullptr, ws);
+        }
+    }
+
+    // Populate extra town keywords
+    if (extraTownKeywords) {
+        std::uint32_t count = extraTownKeywords->GetSize();
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto form = extraTownKeywords->GetAt(i);
+            if (!form) continue;
+            auto kw = form->As<RE::BGSKeyword>();
+            if (kw) AddExtraTownKeyword(nullptr, kw);
+        }
+    }
+
+    // Populate extra dungeon keywords
+    if (extraDunKeywords) {
+        std::uint32_t count = extraDunKeywords->GetSize();
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto form = extraDunKeywords->GetAt(i);
+            if (!form) continue;
+            auto kw = form->As<RE::BGSKeyword>();
+            if (kw) AddExtraDunKeyword(nullptr, kw);
+        }
+    }
+
+    SKSE::log::info("InitializeNativeSystem: populated native caches (interior/walled/extra keywords)");
+}
+
+// Debug helper to dump current native cached state to log (placeholder for serialization)
+void DumpNativeState(RE::StaticFunctionTag*) {
+    SKSE::log::info("--- Dumping native cached state ---");
+
+    SKSE::log::info("Interior worldspaces: {} entries", g_forms.interiorWorldspaces.size());
+    for (auto id : g_forms.interiorWorldspaces) {
+        SKSE::log::info("  {:08X}", id);
+    }
+
+    SKSE::log::info("Walled town worldspaces: {} entries", g_forms.walledTownWorldspaces.size());
+    for (auto id : g_forms.walledTownWorldspaces) {
+        SKSE::log::info("  {:08X}", id);
+    }
+
+    SKSE::log::info("Extra town keywords: {} entries", g_forms.extraTownKeywords.size());
+    for (auto id : g_forms.extraTownKeywords) {
+        SKSE::log::info("  {:08X}", id);
+    }
+
+    SKSE::log::info("Extra dungeon keywords: {} entries", g_forms.extraDunKeywords.size());
+    for (auto id : g_forms.extraDunKeywords) {
+        SKSE::log::info("  {:08X}", id);
+    }
+
+    if (g_forms.locTypeCity) SKSE::log::info("LocTypeCity cached: {:08X}", g_forms.locTypeCity->GetFormID());
+    if (g_forms.locTypeTown) SKSE::log::info("LocTypeTown cached: {:08X}", g_forms.locTypeTown->GetFormID());
+    if (g_forms.locTypeClearable) SKSE::log::info("LocTypeClearable cached: {:08X}", g_forms.locTypeClearable->GetFormID());
+
+    if (g_forms.locationMarker) SKSE::log::info("Location marker ref cached: {:08X}", g_forms.locationMarker->GetFormID());
+
+    SKSE::log::info("--- End dump ---");
 }
 
 // Native helper to be called from MCM initialize. Populates native caches and runs quick tests.
