@@ -6,7 +6,7 @@ includes("lib/commonlibsse-ng")
 
 -- set project
 set_project("paceyourself-re")
-set_version("2.0.0")
+set_version("2.2.0")
 set_license("BSD-2-Clause")
 
 -- set defaults
