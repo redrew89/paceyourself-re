@@ -4,200 +4,43 @@ Scriptname PYS_UtilScript Hidden
 ; Native Function Declarations
 ; =======================
 
-; Original walk/run state functions
-bool Function SetPlayerWalkRunState(bool shouldRun) Global Native
-bool Function GetPlayerWalkRunState() Global Native
-
 string Function GetPluginVersion() Global Native
-
-; New native movement logic functions
-bool Function ShouldRunHere() Global Native
-bool Function AutoSetPlayerMovement() Global Native
 
 ; Configuration functions
 Function SetMovementConfig(bool modActive, int combatRun, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDist) Global Native
-Function SetDetailedLogging(bool bLog) global native
-Function ReinitializeKeywords() global native
-Function SetLocationMarker(ObjectReference marker) Global Native
 
-; Form collection functions
-Function AddInteriorWorldspace(WorldSpace worldspace) Global Native
-Function AddWalledTownWorldspace(WorldSpace worldspace) Global Native
-Function AddExtraTownKeyword(Keyword keyword) Global Native
-Function AddExtraDunKeyword(Keyword keyword) Global Native
-
-; Debug functions
-Function LogCurrentConfig() Global Native
-Function LogCurrentLocation() Global Native
-bool Function GetCurrentConfig(int configType) Global Native
-; configType: 0=modActive, 1=walkInTowns, 2=walkInTownsUnwalled, 3=walkInDungeons, 4=combatRun
-
-; =======================
-; Helper Functions for Papyrus Compatibility
-; =======================
-
-; --- MCM migration native helpers ---
+; Populates native config and form caches from the MCM's FormLists, and enables the native reaction pipeline
 Function NativeMCM_Initialize(Actor PlayerRef, GlobalVariable PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, FormList interiorWorldspaces = None, FormList walledTownWorldspaces = None, FormList extraTownKeywords = None, FormList extraDunKeywords = None) Global Native
 
-int Function NativeMCM_SetRunState(Actor akActor, bool playerOverride, bool inputRunPressed, float timeout) Global Native
-
-; Native override helpers
+; Keys polled by the native input thread
 Function SetNativeOverrideKey(int keyCode) Global Native
 Function SetNativeRunKey(int keyCode) Global Native
-int Function NativeMCM_HandleOverride(int akKey) Global Native
- 
-bool Function GetNativePlayerOverride() Global Native
-Function SetNativePlayerOverride(bool state) Global Native
 
+; Native reaction pipeline - shaders, messages, cooldown and refresh scheduling
+; shaderFX: 0=disabled, 1=red/green, 2=orange/blue, 3=yellow/purple
+Function SetFeedbackConfig(int shaderFX, bool msgVerbose, float refreshTime, float timeout, bool detailLog) Global Native
+Function RequestRunStateEvaluation() Global Native
 
-; Initialize the native system with form lists (call this during mod startup)
-Function InitializeNativeSystem(GlobalVariable PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, FormList interiorWorldspaces = None, FormList walledTownWorldspaces = None, FormList extraTownKeywords = None, FormList extraDunKeywords = None) Global
-    
-    ; Set basic configuration
-    bool modActive = (PYS_Active.GetValueInt() != 0)
-    SetMovementConfig(modActive, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance)
-    
-    ; Populate interior worldspaces
-    if interiorWorldspaces
-        int i = 0
-        int count = interiorWorldspaces.GetSize()
-        while i < count
-            WorldSpace ws = interiorWorldspaces.GetAt(i) as WorldSpace
-            if ws
-                AddInteriorWorldspace(ws)
-            endif
-            i += 1
-        endwhile
-    endif
-    
-    ; Populate walled town worldspaces
-    if walledTownWorldspaces
-        int i = 0
-        int count = walledTownWorldspaces.GetSize()
-        while i < count
-            WorldSpace ws = walledTownWorldspaces.GetAt(i) as WorldSpace
-            if ws
-                AddWalledTownWorldspace(ws)
-            endif
-            i += 1
-        endwhile
-    endif
-    
-    ; Populate extra town keywords
-    if extraTownKeywords
-        int i = 0
-        int count = extraTownKeywords.GetSize()
-        while i < count
-            Keyword kw = extraTownKeywords.GetAt(i) as Keyword
-            if kw
-                AddExtraTownKeyword(kw)
-            endif
-            i += 1
-        endwhile
-    endif
-    
-    ; Populate extra dungeon keywords
-    if extraDunKeywords
-        int i = 0
-        int count = extraDunKeywords.GetSize()
-        while i < count
-            Keyword kw = extraDunKeywords.GetAt(i) as Keyword
-            if kw
-                AddExtraDunKeyword(kw)
-            endif
-            i += 1
-        endwhile
-    endif
-    
-EndFunction
+; =======================
+; Helper Functions
+; =======================
 
 ; Update configuration at runtime (for MCM changes)
 Function UpdateNativeConfig(GlobalVariable PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance) Global
-    bool modActive = (PYS_Active.GetValueInt() != 0)
-    
-	PYS_MCMScript MCM = Game.GetFormFromFile(2817, "PaceYourself.esp") as PYS_MCMScript
-    ; Log what we're trying to set
-    MCM.LogMsg("UpdateNativeConfig called with:",false)
-    MCM.LogMsg("  modActive: " + modActive,false)
-    MCM.LogMsg("  combatRunSetting: " + combatRunSetting, false)
-    MCM.LogMsg("  walkInTowns: " + walkInTowns,false )
-    MCM.LogMsg("  walkInTownsUnwalled: " + walkInTownsUnwalled, false)
-    MCM.LogMsg("  walkInDungeons: " + walkInDungeons,false)
-    MCM.LogMsg("  maxDistance: " + maxDistance,false)
-    
-    SetMovementConfig(modActive, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance)
-    
-    ; Verify the settings took effect
-    Utility.Wait(0.1) ; Small delay to ensure native code processed the change
-    
-    MCM.LogMsg("Verification - walkInTowns setting: " + GetCurrentConfig(1),false)
-    MCM.LogMsg("Verification - walkInTownsUnwalled setting: " + GetCurrentConfig(2),false)
+	SetMovementConfig(PYS_Active.GetValueInt() != 0, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance)
 EndFunction
-
-; =======================
-; Debug/Logging Functions
-; =======================
-
-; Test function to verify native integration
-Function TestNativeFunctions() Global
-    
-	PYS_MCMScript MCM = Game.GetFormFromFile(2817, "PaceYourself.esp") as PYS_MCMScript
-	
-	MCM.LogMsg("=== PYS Native Function Test ===", false)
-    
-    ; Test basic state functions
-    bool currentState = GetPlayerWalkRunState()
-    MCM.LogMsg("Current movement state: " + currentState, false)
-    
-    ; Test decision logic
-    bool shouldRun = ShouldRunHere()
-    MCM.LogMsg("Should run decision: " + shouldRun, false)
-    
-    ; Test auto movement
-    bool newState = AutoSetPlayerMovement()
-    MCM.LogMsg("Auto movement result: " + newState, false)
-    
-    ; Log current configuration and location
-    LogCurrentConfig()
-    LogCurrentLocation()
-    
-    MCM.LogMsg("=== Test Complete ===",false)
-EndFunction
-
-; MCM debugging function - call this from your MCM when settings change
-Function DebugMCMSettings(GlobalVariable PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance) Global
-
-	PYS_MCMScript MCM = Game.GetFormFromFile(2817, "PaceYourself.esp") as PYS_MCMScript
-	
-    MCM.LogMsg("=== MCM Debug - Before Update ===",false)
-    LogCurrentConfig()
-    
-    UpdateNativeConfig(PYS_Active, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance)
-    
-    MCM.LogMsg("=== MCM Debug - After Update ===",false)
-    LogCurrentConfig()
-    
-    ; Test the decision logic with current location
-    LogCurrentLocation()
-    bool shouldRun = ShouldRunHere()
-    MCM.LogMsg("Movement decision with new settings: " + shouldRun,false)
-EndFunction
-
-; ---- UTILITY FUNCTIONS -- Now relocated to PYS_UtilScript
-
 
 Function CheckGamepad()	Global
-	
+
 	PYS_MCMScript MCM = Game.GetFormFromFile(2817, "PaceYourself.esp") as PYS_MCMScript
-	
-	if Game.UsingGamepad()		
+
+	if Game.UsingGamepad()
 		MCM.LogMsg("Gamepad detected.")
 		if SKSE.GetPluginVersion("SkyrimMotionControl") != -1
 			MCM.LogMsg("SMC detected. Set gamepad walkstate in SMC Beta SKSE Menu Framework.")
 			MCM.PYS_hasSMC = true
 		else
 			MCM.LogMsg("Shutting down. Restart without gamepad to resume.")
-			;MCM.PlayerRef.RemoveSpell(MCM.PYS_TrackerSpell)
 			MCM.PYS_Active.SetValueInt(0)
 			MCM.PYS_globalToggle = false
 			MCM.ToggleModFlag(false)
@@ -205,7 +48,7 @@ Function CheckGamepad()	Global
 	else
 		MCM.PYS_Active.SetValueInt(1)
 		MCM.PYS_globalToggle = true
-		MCM.ToggleModFlag(true)		
+		MCM.ToggleModFlag(true)
 	endif
 
 	UpdateNativeConfig(MCM.PYS_Active, MCM.PYS_combatRun, MCM.PYS_walkInTowns, MCM.PYS_walkInTownsUnwalled, MCM.PYS_walkInDungeons, MCM.PYS_maxDist)

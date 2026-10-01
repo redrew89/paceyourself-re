@@ -1,10 +1,6 @@
 Scriptname PYS_PlayerLoadScript extends ReferenceAlias
 
-
-
 PYS_MCMScript Property MCM Auto
-
-Actor Property PlayerRef Auto
 
 event OnPlayerLoadGame()
 	Utility.Wait(2)
@@ -21,15 +17,3 @@ event OnInit()
 	endif
 	
 endevent
-
-Function SystemReset()
-
-		(MCM as Quest).Reset()
-		(MCM as Quest).Stop()
-		(MCM as Quest).Start()
-		
-endFunction
-
-
-
-

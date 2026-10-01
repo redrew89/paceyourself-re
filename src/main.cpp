@@ -1,12 +1,8 @@
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
-#include <vector>
 #include <unordered_set>
 #include <string>
 #include <format>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -17,7 +13,7 @@
 using namespace std::literals;
 
 // Plugin version using CommonLibSSE-NG's version system
-constexpr REL::Version PLUGIN_VERSION{ 2, 2, 0 };
+constexpr REL::Version PLUGIN_VERSION{ 2, 5, 0 };
 
 // Function to get plugin version as string
 std::string GetPluginVersionString()
@@ -26,27 +22,6 @@ std::string GetPluginVersionString()
         PLUGIN_VERSION.major(),
         PLUGIN_VERSION.minor(),
         PLUGIN_VERSION.patch());
-}
-
-// Alternative using string concatenation (C++17 compatible)
-std::string GetPluginVersionStringCompat()
-{
-    return std::to_string(PLUGIN_VERSION.major()) + "." +
-        std::to_string(PLUGIN_VERSION.minor()) + "." +
-        std::to_string(PLUGIN_VERSION.patch());
-}
-
-// Get version with optional build number
-std::string GetFullPluginVersionString()
-{
-    if (PLUGIN_VERSION.build() > 0) {
-        return std::format("{}.{}.{}.{}",
-            PLUGIN_VERSION.major(),
-            PLUGIN_VERSION.minor(),
-            PLUGIN_VERSION.patch(),
-            PLUGIN_VERSION.build());
-    }
-    return GetPluginVersionString();
 }
 
 // Configuration structure to hold mod settings
@@ -73,8 +48,6 @@ struct CachedForms {
     RE::BGSKeyword* locTypeCity = nullptr;
     RE::BGSKeyword* locTypeTown = nullptr;
     RE::BGSKeyword* locTypeClearable = nullptr;
-
-    RE::TESObjectREFR* locationMarker = nullptr;
 
     void InitializeKeywords() {
         auto dataHandler = RE::TESDataHandler::GetSingleton();
@@ -143,20 +116,38 @@ CachedForms g_forms;
 // referenced earlier by NativeMCM_HandleOverride, RegisterPapyrusFunctions,
 // and SKSEPluginLoad).
 bool ShouldRunHere(RE::StaticFunctionTag*);
-int GetPlayerLocationInfo(RE::StaticFunctionTag*);
-std::string GetPlayerLocationName(RE::StaticFunctionTag*);
-void InitializeNativeSystem(RE::StaticFunctionTag*, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSListForm* interiorWorldspaces, RE::BGSListForm* walledTownWorldspaces, RE::BGSListForm* extraTownKeywords, RE::BGSListForm* extraDunKeywords);
-void DumpNativeState(RE::StaticFunctionTag*);
-void SaveNativeCache(RE::StaticFunctionTag*);
-void LoadNativeCache(RE::StaticFunctionTag*);
 void NativeMCM_Initialize(RE::StaticFunctionTag*, RE::Actor* PlayerRef, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSListForm* interiorWorldspaces, RE::BGSListForm* walledTownWorldspaces, RE::BGSListForm* extraTownKeywords, RE::BGSListForm* extraDunKeywords);
-int NativeMCM_SetRunState(RE::StaticFunctionTag*, RE::Actor* akActor, bool playerOverride, bool inputRunPressed, float timeout);
-void LoadNativeCacheFromDisk();
+void CheckLocationTransition();
+void CheckCombatTransition();
+void EvaluateRunState(const char* reason);
+void HandleNativeKey(int keyCode, bool down);
+void SetFeedbackConfig(RE::StaticFunctionTag*, int shaderFX, bool msgVerbose, float refreshTime, float timeout, bool detailLog);
+void RequestRunStateEvaluation(RE::StaticFunctionTag*);
 
-// Override key state tracked natively
-int g_overrideKeyCode = -1;
-int g_runKeyCode = -1;
-bool g_playerOverride = false;
+// Override key state tracked natively. Written from Papyrus / the main thread and
+// read by the input polling thread, hence atomic.
+std::atomic<int> g_overrideKeyCode{ -1 };
+std::atomic<int> g_runKeyCode{ -1 };
+std::atomic_bool g_playerOverride{ false };
+std::atomic_bool g_runKeyHeld{ false };
+
+// Reaction pipeline state. The pipeline only runs once Papyrus has initialized
+// it for the current save (NativeMCM_Initialize), and is reset on revert.
+std::atomic_bool g_pipelineActive{ false };
+
+// Next scheduled SetRunState evaluation, as a steady_clock tick count (0 = none).
+// Native equivalent of the MCM's RegisterForSingleUpdate: scheduling replaces any
+// pending evaluation. The input polling thread fires it via the task interface.
+std::atomic<std::chrono::steady_clock::rep> g_nextEvaluation{ 0 };
+
+// Time of the last automatic walk/run toggle, for the cooldown. Reset on revert.
+auto g_lastToggle = std::chrono::steady_clock::time_point::min();
+
+void ScheduleEvaluation(float seconds) {
+    auto due = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<float>(seconds));
+    g_nextEvaluation.store(due.time_since_epoch().count());
+}
 
 // Input polling thread
 static std::thread g_inputThread;
@@ -165,34 +156,49 @@ static std::atomic_bool g_inputThreadRunning{ false };
 // Papyrus's Input.GetMappedKey() returns DirectInput scan codes (DIK_*),
 // but GetAsyncKeyState() expects Win32 virtual-key codes (VK_*). Convert so
 // the polling loop actually tests the key the user bound.
-int g_overrideKeyVK = -1;
-int g_runKeyVK = -1;
+std::atomic<int> g_overrideKeyVK{ -1 };
+std::atomic<int> g_runKeyVK{ -1 };
 
 int DIKToVK(int dikCode) {
     if (dikCode < 0 || dikCode > 0xFF) {
         return -1; // mouse/gamepad codes aren't keyboard scan codes; unsupported by GetAsyncKeyState
     }
+
+    // Some keys map differently depending on whether the extended-scancode path is used.
+    // Fall back to the standard conversion if the EX form does not resolve a value.
     UINT vk = MapVirtualKeyW(static_cast<UINT>(dikCode), MAPVK_VSC_TO_VK_EX);
-    return vk != 0 ? static_cast<int>(vk) : -1;
+    if (vk == 0) {
+        vk = MapVirtualKeyW(static_cast<UINT>(dikCode), MAPVK_VSC_TO_VK);
+    }
+
+    // Final safety net: if a key still resolves to 0, keep the original DIK code
+    // only as a last resort for debugging; otherwise the polling loop would be blind.
+    if (vk == 0) {
+        SKSE::log::info("DIKToVK fallback: DIK {} did not resolve to a valid VK; leaving as-is", dikCode);
+        return dikCode;
+    }
+
+    return static_cast<int>(vk);
 }
 
 // Set native key codes (called from Papyrus during initialize)
 void SetNativeOverrideKey(RE::StaticFunctionTag*, std::int32_t keyCode) {
+    int vk = DIKToVK(keyCode);
     g_overrideKeyCode = keyCode;
-    g_overrideKeyVK = DIKToVK(keyCode);
-    SKSE::log::info("SetNativeOverrideKey: {} (VK {})", keyCode, g_overrideKeyVK);
+    g_overrideKeyVK = vk;
+    SKSE::log::info("SetNativeOverrideKey: {} (VK {})", keyCode, vk);
 }
 
 void SetNativeRunKey(RE::StaticFunctionTag*, std::int32_t keyCode) {
+    int vk = DIKToVK(keyCode);
     g_runKeyCode = keyCode;
-    g_runKeyVK = DIKToVK(keyCode);
-    SKSE::log::info("SetNativeRunKey: {} (VK {})", keyCode, g_runKeyVK);
+    g_runKeyVK = vk;
+    SKSE::log::info("SetNativeRunKey: {} (VK {})", keyCode, vk);
 }
 
 // Handle override key press logic natively. Returns flags:
 // bit0 = player manually overrode (should show disable shader/msg),
-// bit1 = player choice aligns (should show enable shader/msg and reapply state),
-// bit2 = request to reapply current player state via SetPlayerWalkRunState
+// bit1 = player choice aligns (should show enable shader/msg)
 int NativeMCM_HandleOverride(RE::StaticFunctionTag*, std::int32_t akKey) {
     auto player = RE::PlayerCharacter::GetSingleton();
     if (!player) return 0;
@@ -215,80 +221,67 @@ int NativeMCM_HandleOverride(RE::StaticFunctionTag*, std::int32_t akKey) {
         flags |= 1; // player overrode
     } else {
         flags |= 2; // player choice aligns
-        // When the override toggle key was used and player choice aligns, request reapply
-        flags |= 4;
     }
 
     return flags;
-}
-
-bool GetNativePlayerOverride(RE::StaticFunctionTag*) {
-    return g_playerOverride;
-}
-
-// Set native override flag from Papyrus (e.g., on keydown)
-void SetNativePlayerOverride(RE::StaticFunctionTag*, bool state) {
-    g_playerOverride = state;
 }
 
 // Poll keyboard state using Win32 - detects keydown/up transitions
 void InputPollingLoop() {
     int prevOverrideState = 0;
     int prevRunState = 0;
+    int interiorCheckCounter = 0;
     while (g_inputThreadRunning.load()) {
-        if (g_overrideKeyVK != -1) {
-            short state = GetAsyncKeyState(g_overrideKeyVK);
-            int pressed = (state & 0x8000) != 0;
-            if (pressed && !prevOverrideState) {
-                // keydown - notify Papyrus to set override state on main thread
-                if (auto task = SKSE::GetTaskInterface()) {
-                    int keyCode = g_overrideKeyCode;
-                    task->AddTask([keyCode]() {
-                        SKSE::ModCallbackEvent modEvent{ "PYS_NativeKey", "down", static_cast<float>(keyCode), nullptr };
-                        SKSE::GetModCallbackEventSource()->SendEvent(&modEvent);
-                    });
-                }
+        // Piggyback on this thread's cadence to catch location and combat/weapon-
+        // drawn transitions quickly instead of waiting on Papyrus's condition-based
+        // magic effects (which are throttled by the engine and collide with
+        // cell-load hitches) or the ~30s SetRunState fallback poll.
+        // Checked every ~200ms rather than every tick to keep the main-thread task
+        // queue light; actual game-state reads happen inside the Check* functions
+        // on the main thread via the task interface, never here.
+        if (++interiorCheckCounter >= 5) {
+            interiorCheckCounter = 0;
+            if (auto task = SKSE::GetTaskInterface()) {
+                task->AddTask([]() {
+                    CheckLocationTransition();
+                    CheckCombatTransition();
+                });
             }
-            if (!pressed && prevOverrideState) {
-                // keyup
-                // Send key-up mod event to Papyrus (main thread will handle game logic)
-                if (auto task = SKSE::GetTaskInterface()) {
-                    int keyCode = g_overrideKeyCode;
-                    task->AddTask([keyCode]() {
-                        SKSE::ModCallbackEvent modEvent{ "PYS_NativeKey", "up", static_cast<float>(keyCode), nullptr };
-                        SKSE::GetModCallbackEventSource()->SendEvent(&modEvent);
-                    });
-                }
-            }
-            prevOverrideState = pressed;
         }
 
-        if (g_runKeyVK != -1) {
-            short state = GetAsyncKeyState(g_runKeyVK);
-            int pressed = (state & 0x8000) != 0;
-            if (pressed && !prevRunState) {
-                // run key down - notify Papyrus
-                if (auto task = SKSE::GetTaskInterface()) {
-                    int keyCode = g_runKeyCode;
-                    task->AddTask([keyCode]() {
-                        SKSE::ModCallbackEvent modEvent{ "PYS_NativeKey", "down", static_cast<float>(keyCode), nullptr };
-                        SKSE::GetModCallbackEventSource()->SendEvent(&modEvent);
-                    });
-                }
+        // Fire the scheduled SetRunState evaluation once it's due. The exchange
+        // guarantees a given schedule is only fired once even if it's replaced
+        // concurrently.
+        auto due = g_nextEvaluation.load();
+        if (due != 0 && std::chrono::steady_clock::now().time_since_epoch().count() >= due &&
+            g_nextEvaluation.compare_exchange_strong(due, 0)) {
+            if (auto task = SKSE::GetTaskInterface()) {
+                task->AddTask([]() { EvaluateRunState("scheduled refresh"); });
             }
-            if (!pressed && prevRunState) {
-                // run key up
-                if (auto task = SKSE::GetTaskInterface()) {
-                    int keyCode = g_runKeyCode;
-                    task->AddTask([keyCode]() {
-                        SKSE::ModCallbackEvent modEvent{ "PYS_NativeKey", "up", static_cast<float>(keyCode), nullptr };
-                        SKSE::GetModCallbackEventSource()->SendEvent(&modEvent);
-                    });
-                }
-                // Request immediate movement evaluation via Papyrus/script if needed
-            }
-            prevRunState = pressed;
         }
+
+        // Key transitions are handled on the main thread (HandleNativeKey), which
+        // owns all game-state reads and the shader / message feedback.
+        auto pollKey = [](int vk, int keyCode, int& prevState, const char* label) {
+            if (vk == -1) return;
+            int pressed = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            if (pressed != prevState) {
+                if (pressed) {
+                    SKSE::log::info("{} key detected: DIK {} -> VK {} (pressed)", label, keyCode, vk);
+                }
+                if (auto task = SKSE::GetTaskInterface()) {
+                    bool down = pressed != 0;
+                    task->AddTask([keyCode, down]() { HandleNativeKey(keyCode, down); });
+                }
+            }
+            prevState = pressed;
+        };
+
+        pollKey(g_overrideKeyVK, g_overrideKeyCode, prevOverrideState, "Override");
+
+        int runVK = g_runKeyVK;
+        pollKey(runVK, g_runKeyCode, prevRunState, "Run");
+        g_runKeyHeld = runVK != -1 && prevRunState != 0;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
     }
@@ -343,6 +336,169 @@ bool IsInInteriorActual(RE::TESObjectREFR* objectRef) {
     }
 
     return false;
+}
+
+bool HasTownKeyword(RE::BGSLocation* location) {
+    if (!location) return false;
+    return (g_forms.locTypeCity && location->HasKeyword(g_forms.locTypeCity)) ||
+        (g_forms.locTypeTown && location->HasKeyword(g_forms.locTypeTown));
+}
+
+// LocationCenterMarker location ref type (Skyrim.esm)
+static constexpr RE::FormID kLocationCenterMarkerRefType = 0x0001BDF1;
+
+// Finds the LocationCenterMarker for the town the player is in, read straight
+// from the location's LCSR special refs. Replaces PYS_LocationMarkerQuest, which
+// did the same lookup via a quest alias (LocationMarkerAlias, conditioned on
+// LocTypeCity/LocTypeTown) that had to be restarted on every cell change.
+// Checks the location itself first, then walks up through town-keyworded parents
+// in case a town-tagged child location carries no center marker of its own.
+RE::TESObjectREFR* GetTownCenterMarker(RE::BGSLocation* location) {
+    // Cache by location: the poll calls this every ~200ms and the answer only
+    // changes when the location does. Center markers are persistent refs, so the
+    // pointer stays valid for the session.
+    static RE::FormID cachedLocID = 0;
+    static RE::TESObjectREFR* cachedMarker = nullptr;
+
+    if (!location) return nullptr;
+    if (location->GetFormID() == cachedLocID) return cachedMarker;
+
+    RE::TESObjectREFR* found = nullptr;
+    int depth = 0;
+    for (auto loc = location; loc && !found && depth < 8; loc = loc->parentLoc, ++depth) {
+        if (!HasTownKeyword(loc)) continue;
+        for (auto& special : loc->specialRefs) {
+            if (special.type && special.type->GetFormID() == kLocationCenterMarkerRefType) {
+                found = RE::TESForm::LookupByID<RE::TESObjectREFR>(special.refData.refID);
+                if (found) break;
+            }
+        }
+    }
+
+    cachedLocID = location->GetFormID();
+    cachedMarker = found;
+
+    if (g_config.detailLog) {
+        SKSE::log::info("Town center marker for {} ({:08X}): {:08X}",
+            location->GetName(), location->GetFormID(), found ? found->GetFormID() : 0);
+    }
+    return found;
+}
+
+// True when the player is within maxDist of the current town's center marker.
+// Always false when there is no marker (wilderness, non-town location).
+bool IsWithinTownCenterRange(RE::PlayerCharacter* player, RE::BGSLocation* location) {
+    auto marker = GetTownCenterMarker(location);
+    if (!marker) return false;
+    return marker->GetPosition().GetDistance(player->GetPosition()) <= g_config.maxDist;
+}
+
+// Last-observed location inputs to ShouldRunHere, used only to detect
+// transitions. Intentionally in-memory only (not part of SKSE co-save
+// serialization): re-derived from live game state on the next check after any
+// load, so there is nothing meaningful to persist.
+struct LocationSnapshot {
+    bool inInterior = false;
+    RE::FormID locationID = 0;
+    RE::FormID worldspaceID = 0;
+    bool withinTownRange = false;
+
+    bool operator==(const LocationSnapshot&) const = default;
+};
+static LocationSnapshot g_lastLocation;
+static bool g_locationStateInitialized = false;
+
+// Runs on the main thread (queued via the task interface from the input polling
+// thread). Replaces the PYS_TrackerSpell / PYS_LocationTrackerScript magic effect
+// and PYS_MarkerTracker's OnCellDetach: detects interior/exterior, location,
+// worldspace and town-center-range changes the instant they happen, and runs
+// EvaluateRunState (cooldown, shader FX, messages) in response. All four are
+// folded into one snapshot so a single transition (e.g. entering a town) triggers
+// one evaluation, not several.
+void CheckLocationTransition() {
+    auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player) return;
+
+    // Not fully loaded into a cell yet (e.g. mid loading-screen) - skip this tick
+    // rather than risk evaluating against a half-attached state.
+    if (!player->GetParentCell()) return;
+
+    EnsureKeywordsInitialized();
+
+    auto currentLoc = player->GetCurrentLocation();
+    auto worldspace = player->GetWorldspace();
+
+    LocationSnapshot now;
+    now.inInterior = IsInInteriorActual(player);
+    now.locationID = currentLoc ? currentLoc->GetFormID() : 0;
+    now.worldspaceID = worldspace ? worldspace->GetFormID() : 0;
+    // Range only affects the decision when unwalled-town walking is enabled;
+    // skip it otherwise so walking around a town doesn't fire pointless events.
+    now.withinTownRange = g_config.walkInTowns && g_config.walkInTownsUnwalled &&
+        IsWithinTownCenterRange(player, currentLoc);
+
+    if (!g_locationStateInitialized) {
+        g_lastLocation = now;
+        g_locationStateInitialized = true;
+        return;
+    }
+
+    if (now == g_lastLocation) return;
+
+    SKSE::log::info("Native location transition detected: interior {} -> {}, location {:08X} -> {:08X}, worldspace {:08X} -> {:08X}, in town range {} -> {}",
+        g_lastLocation.inInterior, now.inInterior,
+        g_lastLocation.locationID, now.locationID,
+        g_lastLocation.worldspaceID, now.worldspaceID,
+        g_lastLocation.withinTownRange, now.withinTownRange);
+
+    g_lastLocation = now;
+
+    EvaluateRunState("location transition");
+}
+
+// Single definition of "combat state" shared by the transition detector and
+// ShouldRunHere, so the two can never disagree about whether we're in combat.
+// Mirrors the old PYS_PlayerWeaponScript magic effect: in combat OR weapon drawn.
+bool IsPlayerInCombatState(RE::PlayerCharacter* player) {
+    if (!player) return false;
+    auto actorState = player->AsActorState();
+    return player->IsInCombat() || (actorState && actorState->IsWeaponDrawn());
+}
+
+// Last-observed combat state. Same rationale as g_lastLocation: in-memory
+// only, re-derived from live game state on the first check after any load.
+static bool g_lastCombatState = false;
+static bool g_combatStateInitialized = false;
+
+// Runs on the main thread alongside CheckLocationTransition. Replaces the
+// PYS_PlayerWeaponScript magic effect: detects entering/leaving combat (or
+// drawing/sheathing a weapon) and runs EvaluateRunState so the MCM "Preferred
+// Combat State" is applied through the normal pipeline.
+void CheckCombatTransition() {
+    auto player = RE::PlayerCharacter::GetSingleton();
+    if (!player) return;
+    if (!player->GetParentCell()) return;
+
+    bool nowInCombat = IsPlayerInCombatState(player);
+
+    if (!g_combatStateInitialized) {
+        g_lastCombatState = nowInCombat;
+        g_combatStateInitialized = true;
+        return;
+    }
+
+    if (nowInCombat == g_lastCombatState) return;
+
+    // Always track the state, even when the preference is "Do Nothing", so that
+    // changing the MCM setting mid-combat doesn't produce a phantom transition.
+    g_lastCombatState = nowInCombat;
+
+    if (!g_config.modActive || g_config.combatRun == 0) return;
+
+    SKSE::log::info("Native combat transition detected: now {} (combatRun: {})",
+        nowInCombat ? "in combat" : "out of combat", g_config.combatRun);
+
+    EvaluateRunState(nowInCombat ? "combat enter" : "combat exit");
 }
 
 // Enhanced location debugging function
@@ -400,22 +556,14 @@ bool ShouldRunHere(RE::StaticFunctionTag*) {
         return true;
     }
 
-    auto currentLoc = player->GetCurrentLocation();
-    if (!currentLoc) {
-        return true; // In wilderness - auto-run enabled
-    }
-
-    if (g_config.detailLog) {
-        DebugLocationKeywords(currentLoc);
-    }
-
-    // Combat state check
-    bool playerIsInCombat = player->IsInCombat() || player->AsActorState()->IsWeaponDrawn();
+    // Combat state check - must come before the wilderness early-out below, or the
+    // combat preference would be ignored everywhere without a BGSLocation.
+    bool playerIsInCombat = IsPlayerInCombatState(player);
     bool changeCombatState = (g_config.combatRun != 0);
 
     if (g_config.detailLog) {
-        SKSE::log::info("Combat state: {}, Weapon drawn: {}, playerIsInCombat: {}, combatRun: {}",
-            player->IsInCombat(), player->AsActorState()->IsWeaponDrawn(), playerIsInCombat, g_config.combatRun);
+        SKSE::log::info("Combat state: {}, playerIsInCombat (combat or weapon drawn): {}, combatRun: {}",
+            player->IsInCombat(), playerIsInCombat, g_config.combatRun);
     }
 
     if (playerIsInCombat) {
@@ -433,6 +581,15 @@ bool ShouldRunHere(RE::StaticFunctionTag*) {
             }
             return (g_config.combatRun == 1);
         }
+    }
+
+    auto currentLoc = player->GetCurrentLocation();
+    if (!currentLoc) {
+        return true; // In wilderness - auto-run enabled
+    }
+
+    if (g_config.detailLog) {
+        DebugLocationKeywords(currentLoc);
     }
 
     // Location analysis
@@ -483,8 +640,8 @@ bool ShouldRunHere(RE::StaticFunctionTag*) {
             }
 
             // Distance check for regular unwalled towns
-            if (g_forms.locationMarker) {
-                float distanceFromMarker = g_forms.locationMarker->GetPosition().GetDistance(player->GetPosition());
+            if (auto centerMarker = GetTownCenterMarker(currentLoc)) {
+                float distanceFromMarker = centerMarker->GetPosition().GetDistance(player->GetPosition());
                 SKSE::log::info("  -> Distance from marker: {} (max: {})",
                     distanceFromMarker, g_config.maxDist);
                 if (distanceFromMarker <= g_config.maxDist) {
@@ -564,23 +721,6 @@ void SetMovementConfig(RE::StaticFunctionTag*, bool modActive, int combatRun,
     SKSE::log::info("  maxDist: {}", maxDist);
 }
 
-// Function to enable detailed debug logging
-void SetDetailedLogging(RE::StaticFunctionTag*, bool enabled) {
-    g_config.detailLog = enabled;
-    SKSE::log::info("Detailed logging set to: {}", enabled);
-}
-
-// Function to force reinitialize keywords (for troubleshooting)
-void ReinitializeKeywords(RE::StaticFunctionTag*) {
-    SKSE::log::info("Force reinitializing keywords...");
-    g_forms.InitializeKeywords();
-}
-
-// Function to set location marker reference
-void SetLocationMarker(RE::StaticFunctionTag*, RE::TESObjectREFR* marker) {
-    g_forms.locationMarker = marker;
-}
-
 // Functions to populate form collections (called during mod initialization)
 void AddInteriorWorldspace(RE::StaticFunctionTag*, RE::TESWorldSpace* worldspace) {
     if (worldspace) {
@@ -606,136 +746,21 @@ void AddExtraDunKeyword(RE::StaticFunctionTag*, RE::BGSKeyword* keyword) {
     }
 }
 
-// Debug functions to help troubleshoot MCM issues
-void LogCurrentConfig(RE::StaticFunctionTag*) {
-    SKSE::log::info("=== Current Movement Configuration ===");
-    SKSE::log::info("modActive: {}", g_config.modActive);
-    SKSE::log::info("combatRun: {}", g_config.combatRun);
-    SKSE::log::info("walkInTowns: {}", g_config.walkInTowns);
-    SKSE::log::info("walkInTownsUnwalled: {}", g_config.walkInTownsUnwalled);
-    SKSE::log::info("walkInDungeons: {}", g_config.walkInDungeons);
-    SKSE::log::info("maxDist: {}", g_config.maxDist);
-    SKSE::log::info("detailLog: {}", g_config.detailLog);
-    SKSE::log::info("=== End Configuration ===");
-}
-
-void LogCurrentLocation(RE::StaticFunctionTag*) {
-    auto player = RE::PlayerCharacter::GetSingleton();
-    if (!player) return;
-
-    // Ensure keywords are initialized
-    EnsureKeywordsInitialized();
-
-    auto currentLoc = player->GetCurrentLocation();
-    if (currentLoc) {
-        DebugLocationKeywords(currentLoc);
-
-        auto worldspace = player->GetWorldspace();
-        if (worldspace) {
-            SKSE::log::info("Worldspace: {} ({:08X})", worldspace->GetName(), worldspace->GetFormID());
-        }
-    }
-    else {
-        SKSE::log::info("Player is in wilderness (no location)");
-    }
-}
-
-bool GetCurrentConfig(RE::StaticFunctionTag*, int configType) {
-    switch (configType) {
-    case 0: return g_config.modActive;
-    case 1: return g_config.walkInTowns;
-    case 2: return g_config.walkInTownsUnwalled;
-    case 3: return g_config.walkInDungeons;
-    case 4: return (g_config.combatRun == 1);
-    default: return false;
-    }
-}
-
-// Native function to set player's walk-run state
-// Returns the current walk-run state (true = running, false = walking)
-bool SetPlayerWalkRunState(RE::StaticFunctionTag*, bool shouldRun) {
-    auto player = RE::PlayerCharacter::GetSingleton();
-    if (!player) {
-        return false;
-    }
-    auto playerControls = RE::PlayerControls::GetSingleton();
-    if (!playerControls) {
-        return false;
-    }
-    // Get current walk-run state before potentially changing it
-    bool currentState = playerControls->data.running;
-    // Set the new walk-run state if different from current
-    if (shouldRun != currentState) {
-        // Set the run state directly
-        playerControls->data.running = shouldRun;
-    }
-    // Return the new state (true = running, false = walking)
-    return shouldRun;
-}
-
-// Simple getter function for current walk-run state
-bool GetPlayerWalkRunState(RE::StaticFunctionTag*) {
-    auto playerControls = RE::PlayerControls::GetSingleton();
-    if (!playerControls) {
-        return true; // Default to running if we can't get controls
-    }
-    // Return current state (true = running, false = walking)
-    return playerControls->data.running;
-}
-
 // Papyrus function to get plugin version
 std::string GetPluginVersion(RE::StaticFunctionTag*) {
     return GetPluginVersionString();
 }
 
-// Register the native functions with Papyrus
+
+// Register the native functions Papyrus still calls
 bool RegisterPapyrusFunctions(RE::BSScript::IVirtualMachine* vm) {
-    // Version function
     vm->RegisterFunction("GetPluginVersion", "PYS_UtilScript", GetPluginVersion);
-
-    // Original functions
-    vm->RegisterFunction("SetPlayerWalkRunState", "PYS_UtilScript", SetPlayerWalkRunState);
-    vm->RegisterFunction("GetPlayerWalkRunState", "PYS_UtilScript", GetPlayerWalkRunState);
-
-    // New movement logic functions
-    vm->RegisterFunction("ShouldRunHere", "PYS_UtilScript", ShouldRunHere);
-    vm->RegisterFunction("AutoSetPlayerMovement", "PYS_UtilScript", AutoSetPlayerMovement);
-
-    // Configuration functions
     vm->RegisterFunction("SetMovementConfig", "PYS_UtilScript", SetMovementConfig);
-    vm->RegisterFunction("SetDetailedLogging", "PYS_UtilScript", SetDetailedLogging);
-    vm->RegisterFunction("ReinitializeKeywords", "PYS_UtilScript", ReinitializeKeywords);
-    vm->RegisterFunction("SetLocationMarker", "PYS_UtilScript", SetLocationMarker);
-
-    // Form collection functions
-    vm->RegisterFunction("AddInteriorWorldspace", "PYS_UtilScript", AddInteriorWorldspace);
-    vm->RegisterFunction("AddWalledTownWorldspace", "PYS_UtilScript", AddWalledTownWorldspace);
-    vm->RegisterFunction("AddExtraTownKeyword", "PYS_UtilScript", AddExtraTownKeyword);
-    vm->RegisterFunction("AddExtraDunKeyword", "PYS_UtilScript", AddExtraDunKeyword);
-
-    // Debug functions
-    vm->RegisterFunction("LogCurrentConfig", "PYS_UtilScript", LogCurrentConfig);
-    vm->RegisterFunction("LogCurrentLocation", "PYS_UtilScript", LogCurrentLocation);
-    vm->RegisterFunction("GetCurrentConfig", "PYS_UtilScript", GetCurrentConfig);
-
-    // New location-tracking helpers
-    vm->RegisterFunction("GetPlayerLocationInfo", "PYS_UtilScript", GetPlayerLocationInfo);
-    vm->RegisterFunction("GetPlayerLocationName", "PYS_UtilScript", GetPlayerLocationName);
-    // Initialization helper to populate native caches from Papyrus FormLists
-    vm->RegisterFunction("InitializeNativeSystem", "PYS_UtilScript", InitializeNativeSystem);
-    // Debug / scaffold: dump native cached state to log (useful until serialization is wired)
-    vm->RegisterFunction("DumpNativeState", "PYS_UtilScript", DumpNativeState);
-    vm->RegisterFunction("SaveNativeCache", "PYS_UtilScript", SaveNativeCache);
-    vm->RegisterFunction("LoadNativeCache", "PYS_UtilScript", LoadNativeCache);
-    // MCM migration helpers
     vm->RegisterFunction("NativeMCM_Initialize", "PYS_UtilScript", NativeMCM_Initialize);
-    vm->RegisterFunction("NativeMCM_SetRunState", "PYS_UtilScript", NativeMCM_SetRunState);
     vm->RegisterFunction("SetNativeOverrideKey", "PYS_UtilScript", SetNativeOverrideKey);
     vm->RegisterFunction("SetNativeRunKey", "PYS_UtilScript", SetNativeRunKey);
-    vm->RegisterFunction("NativeMCM_HandleOverride", "PYS_UtilScript", NativeMCM_HandleOverride);
-    vm->RegisterFunction("GetNativePlayerOverride", "PYS_UtilScript", GetNativePlayerOverride);
-    vm->RegisterFunction("SetNativePlayerOverride", "PYS_UtilScript", SetNativePlayerOverride);
-
+    vm->RegisterFunction("SetFeedbackConfig", "PYS_UtilScript", SetFeedbackConfig);
+    vm->RegisterFunction("RequestRunStateEvaluation", "PYS_UtilScript", RequestRunStateEvaluation);
     return true;
 }
 
@@ -754,9 +779,6 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     // Get Papyrus interface and register functions
     SKSE::GetPapyrusInterface()->Register(RegisterPapyrusFunctions);
 
-    // Load persisted native cache from disk (best-effort)
-    LoadNativeCacheFromDisk();
-
     // Start input polling thread for native-only key handling
     g_inputThreadRunning.store(true);
     g_inputThread = std::thread([]() { InputPollingLoop(); });
@@ -769,7 +791,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
         serialization->SetSaveCallback([](auto ser) {
             SKSE::log::info("Serialization SaveCallback invoked");
             // Open a single record for our data
-            if (!ser->OpenRecord('PYSR', 1)) {
+            // Record version 2: marker ref dropped (now looked up natively per location)
+            if (!ser->OpenRecord('PYSR', 2)) {
                 SKSE::log::error("Failed to open serialization record");
                 return;
             }
@@ -785,10 +808,6 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
             writeSet(g_forms.walledTownWorldspaces);
             writeSet(g_forms.extraTownKeywords);
             writeSet(g_forms.extraDunKeywords);
-
-            // Marker ref
-            std::uint32_t markerID = g_forms.locationMarker ? g_forms.locationMarker->GetFormID() : 0;
-            ser->WriteRecordData(&markerID, sizeof(markerID));
         });
 
         serialization->SetLoadCallback([](auto ser) {
@@ -822,12 +841,10 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
                 readSet(g_forms.extraTownKeywords);
                 readSet(g_forms.extraDunKeywords);
 
-                // Marker
-                std::uint32_t markerID = 0;
-                ser->ReadRecordData(&markerID, sizeof(markerID));
-                if (markerID) {
-                    auto ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(markerID);
-                    if (ref) g_forms.locationMarker = ref;
+                // Version 1 records carry a trailing marker ref; read and discard it
+                if (version < 2) {
+                    std::uint32_t markerID = 0;
+                    ser->ReadRecordData(&markerID, sizeof(markerID));
                 }
             }
         });
@@ -838,71 +855,17 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
             g_forms.walledTownWorldspaces.clear();
             g_forms.extraTownKeywords.clear();
             g_forms.extraDunKeywords.clear();
-            g_forms.locationMarker = nullptr;
+            g_locationStateInitialized = false;
+            g_combatStateInitialized = false;
+            // Papyrus re-initializes the pipeline after the load completes
+            g_pipelineActive = false;
+            g_nextEvaluation = 0;
+            g_playerOverride = false;
+            g_lastToggle = std::chrono::steady_clock::time_point::min();
         });
     }
 
     return true;
-}
-
-// Bitmask flags returned by GetPlayerLocationInfo
-enum LocationFlags : int {
-    LF_None = 0,
-    LF_InInterior = 1 << 0,
-    LF_LocTypeCity = 1 << 1,
-    LF_LocTypeTown = 1 << 2,
-    LF_LocTypeClearable = 1 << 3,
-    LF_ExtraTown = 1 << 4,
-    LF_ExtraDun = 1 << 5,
-    LF_WalledTown = 1 << 6,
-    LF_WithinMarker = 1 << 7,
-    LF_NoLocation = 1 << 8
-};
-
-// Returns bitflags describing the player's current location state.
-int GetPlayerLocationInfo(RE::StaticFunctionTag*) {
-    auto player = RE::PlayerCharacter::GetSingleton();
-    if (!player) return LF_None;
-
-    EnsureKeywordsInitialized();
-
-    auto currentLoc = player->GetCurrentLocation();
-    if (!currentLoc) {
-        return LF_NoLocation;
-    }
-
-    int flags = LF_None;
-
-    if (IsInInteriorActual(player)) flags |= LF_InInterior;
-
-    if (g_forms.locTypeCity && currentLoc->HasKeyword(g_forms.locTypeCity)) flags |= LF_LocTypeCity;
-    if (g_forms.locTypeTown && currentLoc->HasKeyword(g_forms.locTypeTown)) flags |= LF_LocTypeTown;
-    if (g_forms.locTypeClearable && currentLoc->HasKeyword(g_forms.locTypeClearable)) flags |= LF_LocTypeClearable;
-
-    if (CheckAdditionalKeywords(g_forms.extraTownKeywords, currentLoc)) flags |= LF_ExtraTown;
-    if (CheckAdditionalKeywords(g_forms.extraDunKeywords, currentLoc)) flags |= LF_ExtraDun;
-
-    auto currentWorld = player->GetWorldspace();
-    if (currentWorld && g_forms.walledTownWorldspaces.count(currentWorld->GetFormID())) flags |= LF_WalledTown;
-
-    if (g_forms.locationMarker) {
-        float distanceFromMarker = g_forms.locationMarker->GetPosition().GetDistance(player->GetPosition());
-        if (distanceFromMarker <= g_config.maxDist) flags |= LF_WithinMarker;
-    }
-
-    return flags;
-}
-
-// Returns the current location name or an empty string if none (wilderness)
-std::string GetPlayerLocationName(RE::StaticFunctionTag*) {
-    auto player = RE::PlayerCharacter::GetSingleton();
-    if (!player) return std::string();
-
-    auto currentLoc = player->GetCurrentLocation();
-    if (!currentLoc) return std::string();
-
-    auto name = currentLoc->GetName();
-    return name ? std::string(name) : std::string();
 }
 
 // Initialization helper to populate native caches from Papyrus FormLists
@@ -954,54 +917,16 @@ void InitializeNativeSystem(RE::StaticFunctionTag*, RE::TESGlobal* PYS_Active, i
     SKSE::log::info("InitializeNativeSystem: populated native caches (interior/walled/extra keywords)");
 }
 
-// Debug helper to dump current native cached state to log (placeholder for serialization)
-void DumpNativeState(RE::StaticFunctionTag*) {
-    SKSE::log::info("--- Dumping native cached state ---");
-
-    SKSE::log::info("Interior worldspaces: {} entries", g_forms.interiorWorldspaces.size());
-    for (auto id : g_forms.interiorWorldspaces) {
-        SKSE::log::info("  {:08X}", id);
-    }
-
-    SKSE::log::info("Walled town worldspaces: {} entries", g_forms.walledTownWorldspaces.size());
-    for (auto id : g_forms.walledTownWorldspaces) {
-        SKSE::log::info("  {:08X}", id);
-    }
-
-    SKSE::log::info("Extra town keywords: {} entries", g_forms.extraTownKeywords.size());
-    for (auto id : g_forms.extraTownKeywords) {
-        SKSE::log::info("  {:08X}", id);
-    }
-
-    SKSE::log::info("Extra dungeon keywords: {} entries", g_forms.extraDunKeywords.size());
-    for (auto id : g_forms.extraDunKeywords) {
-        SKSE::log::info("  {:08X}", id);
-    }
-
-    if (g_forms.locTypeCity) SKSE::log::info("LocTypeCity cached: {:08X}", g_forms.locTypeCity->GetFormID());
-    if (g_forms.locTypeTown) SKSE::log::info("LocTypeTown cached: {:08X}", g_forms.locTypeTown->GetFormID());
-    if (g_forms.locTypeClearable) SKSE::log::info("LocTypeClearable cached: {:08X}", g_forms.locTypeClearable->GetFormID());
-
-    if (g_forms.locationMarker) SKSE::log::info("Location marker ref cached: {:08X}", g_forms.locationMarker->GetFormID());
-
-    SKSE::log::info("--- End dump ---");
-}
-
-// Native helper to be called from MCM initialize. Populates native caches and runs quick tests.
-void NativeMCM_Initialize(RE::StaticFunctionTag*, RE::Actor* PlayerRef, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSListForm* interiorWorldspaces = nullptr, RE::BGSListForm* walledTownWorldspaces = nullptr, RE::BGSListForm* extraTownKeywords = nullptr, RE::BGSListForm* extraDunKeywords = nullptr) {
+// Called from MCM Initialize. Populates native config and caches, and enables the reaction pipeline.
+void NativeMCM_Initialize(RE::StaticFunctionTag*, RE::Actor* /*PlayerRef*/, RE::TESGlobal* PYS_Active, int combatRunSetting, bool walkInTowns, bool walkInTownsUnwalled, bool walkInDungeons, float maxDistance, RE::BGSListForm* interiorWorldspaces = nullptr, RE::BGSListForm* walledTownWorldspaces = nullptr, RE::BGSListForm* extraTownKeywords = nullptr, RE::BGSListForm* extraDunKeywords = nullptr) {
     SKSE::log::info("NativeMCM_Initialize called");
     // Populate config and caches
     InitializeNativeSystem(nullptr, PYS_Active, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance, interiorWorldspaces, walledTownWorldspaces, extraTownKeywords, extraDunKeywords);
-
-    // Optionally set player reference marker or other initial state
-    if (PlayerRef) {
-        g_forms.locationMarker = nullptr; // safe default; actual marker set via SetLocationMarker
-    }
+    g_pipelineActive = true;
 }
 
-// Simple native wrapper invoked by MCM SetRunState to perform decision + application of run/walk state.
-// Returns the applied run state (true = running, false = walking)
-// Action flags returned to Papyrus
+// Decision + application of run/walk state with cooldown, used by EvaluateRunState.
+// Returns action flags:
 static constexpr std::uint32_t NMS_NONE = 0;
 static constexpr std::uint32_t NMS_CHANGED_TO_RUN = 1 << 0;
 static constexpr std::uint32_t NMS_CHANGED_TO_WALK = 1 << 1;
@@ -1014,7 +939,7 @@ int NativeMCM_SetRunState(RE::StaticFunctionTag*, RE::Actor* akActor, bool playe
 
     if (akActor != player) return NMS_NONE;
 
-    // If player override or input pressed, let Papyrus handle scheduling and skip
+    // If player override or input pressed, leave the player's choice alone
     if (playerOverride || inputRunPressed) {
         return NMS_NONE;
     }
@@ -1025,11 +950,10 @@ int NativeMCM_SetRunState(RE::StaticFunctionTag*, RE::Actor* akActor, bool playe
     }
 
     // Cooldown check (use steady_clock)
-    static auto lastToggle = std::chrono::steady_clock::time_point::min();
     auto now = std::chrono::steady_clock::now();
     float cooldownPeriod = timeout / 4.0f;
-    if (lastToggle != std::chrono::steady_clock::time_point::min()) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::duration<float>>(now - lastToggle).count();
+    if (g_lastToggle != std::chrono::steady_clock::time_point::min()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::duration<float>>(now - g_lastToggle).count();
         if (elapsed < cooldownPeriod) {
             return NMS_COOLDOWN;
         }
@@ -1044,78 +968,210 @@ int NativeMCM_SetRunState(RE::StaticFunctionTag*, RE::Actor* akActor, bool playe
     bool newState = AutoSetPlayerMovement(nullptr);
 
     if (newState != prevState) {
-        lastToggle = now;
+        g_lastToggle = now;
         return newState ? NMS_CHANGED_TO_RUN : NMS_CHANGED_TO_WALK;
     }
 
     return NMS_NONE;
 }
 
-static constexpr const char* kNativeCacheFile = "Data/PaceYourself_NativeCache.txt";
+// =======================
+// Reaction pipeline
+// =======================
+// Native replacement for the MCM's SetRunState / OnNativeKey / ShowOverrideFeedback
+// and its OnUpdate refresh loop. Everything here runs on the main thread: key
+// transitions and the refresh timer are queued from the input polling thread,
+// location / combat transitions call in directly from their Check* functions.
 
-// Simple disk-based persistence (fallback to SKSE save integration later)
-void SaveNativeCacheToDisk() {
-    std::ofstream out(kNativeCacheFile, std::ios::trunc);
-    if (!out) {
-        SKSE::log::warn("SaveNativeCacheToDisk: failed to open {}", kNativeCacheFile);
+// MCM settings that only the reaction pipeline needs (SetFeedbackConfig)
+struct FeedbackConfig {
+    int shaderFX = 1;        // 0 = disabled, 1 = red/green, 2 = orange/blue, 3 = yellow/purple
+    bool msgVerbose = true;
+    float refreshTime = 30.0f;
+    float timeout = 5.0f;
+};
+FeedbackConfig g_feedback;
+
+static constexpr const char* kPluginName = "PaceYourself.esp";
+static constexpr float kChangeShaderDuration = 1.0f;
+static constexpr float kOverrideShaderDuration = 2.0f;
+// While paused / between cells, retry at this interval instead of evaluating
+static constexpr float kDeferredRetrySeconds = 0.5f;
+
+// Shaders and messages from PaceYourself.esp, looked up by local form ID.
+// Override / resume shaders are indexed by the MCM shaderFX setting (index 0 unused).
+struct FeedbackForms {
+    RE::TESEffectShader* changeIndicator = nullptr;  // white - automatic walk/run change
+    RE::TESEffectShader* overrideShaders[4]{};       // player overrode the mod
+    RE::TESEffectShader* resumeShaders[4]{};         // player choice matches the mod
+    RE::BGSMessage* walkMsg = nullptr;
+    RE::BGSMessage* runMsg = nullptr;
+    RE::BGSMessage* pauseMsg = nullptr;
+    RE::BGSMessage* resumeMsg = nullptr;
+    bool resolved = false;
+
+    void Resolve() {
+        if (resolved) return;
+        auto dataHandler = RE::TESDataHandler::GetSingleton();
+        if (!dataHandler) return;
+
+        auto shader = [&](RE::FormID id) { return dataHandler->LookupForm<RE::TESEffectShader>(id, kPluginName); };
+        auto message = [&](RE::FormID id) { return dataHandler->LookupForm<RE::BGSMessage>(id, kPluginName); };
+
+        changeIndicator = shader(0x00C);     // MuffleFXShader_PYSChangeIndicator (white)
+        overrideShaders[1] = shader(0x004);  // MuffleFXShader_PYSDisable (red)
+        resumeShaders[1] = shader(0x005);    // MuffleFXShader_PYSEnable (green)
+        overrideShaders[2] = shader(0x006);  // MuffleFXShader_PYSDisableAlt (orange)
+        resumeShaders[2] = shader(0x007);    // MuffleFXShader_PYSEnableAlt (blue)
+        overrideShaders[3] = shader(0x00B);  // MuffleFXShader_PYSDisableAlt2 (yellow)
+        resumeShaders[3] = shader(0x00A);    // MuffleFXShader_PYSEnableAlt2 (purple)
+        walkMsg = message(0x008);            // PYS_WalkMsg
+        runMsg = message(0x009);             // PYS_RunMsg
+        pauseMsg = message(0x00D);           // PYS_PauseMsg
+        resumeMsg = message(0x00E);          // PYS_ResumeMsg
+        resolved = true;
+
+        bool allFound = changeIndicator && walkMsg && runMsg && pauseMsg && resumeMsg;
+        for (int i = 1; i < 4; ++i) {
+            allFound = allFound && overrideShaders[i] && resumeShaders[i];
+        }
+        if (allFound) {
+            SKSE::log::info("Feedback forms resolved from {}", kPluginName);
+        } else {
+            SKSE::log::warn("Some feedback forms were not found in {}; missing shaders/messages will be skipped", kPluginName);
+        }
+    }
+};
+FeedbackForms g_feedbackForms;
+
+bool IsGamePaused() {
+    auto ui = RE::UI::GetSingleton();
+    return ui && ui->GameIsPaused();
+}
+
+void PlayFeedbackShader(RE::TESEffectShader* shader, float duration) {
+    auto player = RE::PlayerCharacter::GetSingleton();
+    if (player && shader) {
+        player->ApplyEffectShader(shader, duration);
+    }
+}
+
+// Equivalent of Message.Show() for the mod's notification-style messages
+void ShowFeedbackMessage(RE::BGSMessage* message) {
+    if (!message) return;
+    RE::BSString text;
+    message->GetDescription(text, message);
+    if (!text.empty()) {
+        RE::DebugNotification(text.c_str());
+    }
+}
+
+void ShowOverrideFeedback(bool overrode, bool aligns) {
+    if (!overrode && !aligns) return;
+    g_feedbackForms.Resolve();
+
+    int fx = g_feedback.shaderFX;
+    if (fx > 0 && fx < 4) {
+        PlayFeedbackShader(overrode ? g_feedbackForms.overrideShaders[fx] : g_feedbackForms.resumeShaders[fx], kOverrideShaderDuration);
+    }
+
+    SKSE::log::info("{}", overrode ? "Player manually overrode script preference" : "Player choice aligns with script preference");
+    if (g_feedback.msgVerbose) {
+        ShowFeedbackMessage(overrode ? g_feedbackForms.pauseMsg : g_feedbackForms.resumeMsg);
+    }
+}
+
+// Decide and apply walk/run, play feedback, and schedule the next refresh.
+void EvaluateRunState(const char* reason) {
+    if (!g_pipelineActive || !g_config.modActive) return;
+
+    auto player = RE::PlayerCharacter::GetSingleton();
+    // Papyrus never ran while menus were open; match that by deferring until the
+    // game resumes (or the player is attached to a cell again)
+    if (!player || !player->GetParentCell() || IsGamePaused()) {
+        ScheduleEvaluation(kDeferredRetrySeconds);
         return;
     }
 
-    auto writeSet = [&](const char* label, const std::unordered_set<RE::FormID>& s) {
-        out << label << '\n';
-        for (auto id : s) out << std::hex << std::setw(8) << std::setfill('0') << id << '\n';
-    };
-
-    writeSet("INTERIORS", g_forms.interiorWorldspaces);
-    writeSet("WALLED", g_forms.walledTownWorldspaces);
-    writeSet("EXTRA_TOWN_KW", g_forms.extraTownKeywords);
-    writeSet("EXTRA_DUN_KW", g_forms.extraDunKeywords);
-
-    if (g_forms.locationMarker) {
-        out << "MARKER\n" << std::hex << std::setw(8) << std::setfill('0') << g_forms.locationMarker->GetFormID() << '\n';
+    if (g_config.detailLog) {
+        SKSE::log::info("EvaluateRunState: {}", reason);
     }
 
-    out.close();
-    SKSE::log::info("Saved native cache to {}", kNativeCacheFile);
-}
+    // Holding the run key counts as a manual override
+    bool runHeld = g_runKeyHeld;
+    if (runHeld && !g_playerOverride) {
+        g_playerOverride = true;
+        ShowOverrideFeedback(true, false);
+    }
 
-void LoadNativeCacheFromDisk() {
-    std::ifstream in(kNativeCacheFile);
-    if (!in) {
-        SKSE::log::info("No native cache file found: {}", kNativeCacheFile);
+    int flags = NativeMCM_SetRunState(nullptr, player, g_playerOverride, runHeld, g_feedback.timeout);
+
+    if (flags & NMS_COOLDOWN) {
+        SKSE::log::info("Cooldown active - deferring toggle");
+        ScheduleEvaluation(g_feedback.timeout / 2.0f);
         return;
     }
 
-    std::string line;
-    std::string section;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        if (line == "INTERIORS" || line == "WALLED" || line == "EXTRA_TOWN_KW" || line == "EXTRA_DUN_KW" || line == "MARKER") {
-            section = line;
-            continue;
+    if (flags & (NMS_CHANGED_TO_RUN | NMS_CHANGED_TO_WALK)) {
+        g_feedbackForms.Resolve();
+        if (g_feedback.shaderFX != 0) {
+            PlayFeedbackShader(g_feedbackForms.changeIndicator, kChangeShaderDuration);
         }
-
-        // Parse hex formid
-        std::uint32_t id = 0;
-        std::stringstream ss;
-        ss << std::hex << line;
-        ss >> id;
-        if (id == 0) continue;
-
-        if (section == "INTERIORS") g_forms.interiorWorldspaces.insert(id);
-        else if (section == "WALLED") g_forms.walledTownWorldspaces.insert(id);
-        else if (section == "EXTRA_TOWN_KW") g_forms.extraTownKeywords.insert(id);
-        else if (section == "EXTRA_DUN_KW") g_forms.extraDunKeywords.insert(id);
-        else if (section == "MARKER") {
-            auto ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
-            if (ref) g_forms.locationMarker = ref;
+        if (g_feedback.msgVerbose) {
+            ShowFeedbackMessage((flags & NMS_CHANGED_TO_RUN) ? g_feedbackForms.runMsg : g_feedbackForms.walkMsg);
         }
     }
 
-    in.close();
-    SKSE::log::info("Loaded native cache from {}", kNativeCacheFile);
+    ScheduleEvaluation(g_feedback.refreshTime);
 }
 
-// Papyrus-exposed save/load for debugging
-void SaveNativeCache(RE::StaticFunctionTag*) { SaveNativeCacheToDisk(); }
-void LoadNativeCache(RE::StaticFunctionTag*) { LoadNativeCacheFromDisk(); }
+// Override / run key transitions from the input polling thread
+void HandleNativeKey(int keyCode, bool down) {
+    if (!g_pipelineActive || !g_config.modActive) return;
+    // Ignore keys typed into menus / the console. A release after the menu
+    // closes is still handled; it recomputes the override from scratch.
+    if (IsGamePaused()) return;
+
+    if (down) {
+        if (keyCode == g_runKeyCode) {
+            // Hold-to-run key: the override engages as soon as it's held, so give
+            // feedback immediately. If there's no mismatch yet, still treat the
+            // press as a manual override so the feedback isn't a silent no-op.
+            int flags = NativeMCM_HandleOverride(nullptr, keyCode);
+            bool overrode = (flags & 1) != 0;
+            bool aligns = (flags & 2) != 0;
+            if (!overrode && !aligns) {
+                overrode = true;
+            }
+            g_playerOverride = overrode;
+            ShowOverrideFeedback(overrode, aligns);
+        } else {
+            // Toggle key: feedback is shown on release, once the game has applied
+            // the toggle; just mark the override as active for now
+            g_playerOverride = true;
+        }
+        return;
+    }
+
+    // NativeMCM_HandleOverride stores the resulting override state itself
+    int flags = NativeMCM_HandleOverride(nullptr, keyCode);
+    ShowOverrideFeedback((flags & 1) != 0, (flags & 2) != 0);
+}
+
+// Papyrus: push the MCM settings the reaction pipeline uses
+void SetFeedbackConfig(RE::StaticFunctionTag*, int shaderFX, bool msgVerbose, float refreshTime, float timeout, bool detailLog) {
+    g_feedback.shaderFX = std::clamp(shaderFX, 0, 3);
+    g_feedback.msgVerbose = msgVerbose;
+    g_feedback.refreshTime = std::max(refreshTime, 1.0f);
+    g_feedback.timeout = std::max(timeout, 0.1f);
+    g_config.detailLog = detailLog;
+    SKSE::log::info("SetFeedbackConfig: shaderFX {}, msgVerbose {}, refreshTime {}, timeout {}, detailLog {}",
+        g_feedback.shaderFX, msgVerbose, g_feedback.refreshTime, g_feedback.timeout, detailLog);
+}
+
+// Papyrus: evaluate now (on the main thread) - replaces the MCM's SetRunState
+void RequestRunStateEvaluation(RE::StaticFunctionTag*) {
+    if (auto task = SKSE::GetTaskInterface()) {
+        task->AddTask([]() { EvaluateRunState("Papyrus request"); });
+    }
+}
