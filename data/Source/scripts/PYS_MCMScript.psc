@@ -480,7 +480,7 @@ endFunction
 Function Initialize()
 
 
-	PYS_UtilScript.CheckGamepad()
+	PYS_UtilScript.CheckGamepad(self)
 
 	if !PYS_globalToggle || PYS_Active.GetValueInt() == 0
 		return

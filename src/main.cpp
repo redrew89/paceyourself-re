@@ -999,6 +999,7 @@ static constexpr float kOverrideShaderDuration = 2.0f;
 static constexpr float kDeferredRetrySeconds = 0.5f;
 
 // Shaders and messages from PaceYourself.esp, looked up by local form ID.
+// These IDs must be updated if the plugin's records are renumbered.
 // Override / resume shaders are indexed by the MCM shaderFX setting (index 0 unused).
 struct FeedbackForms {
     RE::TESEffectShader* changeIndicator = nullptr;  // white - automatic walk/run change
@@ -1018,17 +1019,17 @@ struct FeedbackForms {
         auto shader = [&](RE::FormID id) { return dataHandler->LookupForm<RE::TESEffectShader>(id, kPluginName); };
         auto message = [&](RE::FormID id) { return dataHandler->LookupForm<RE::BGSMessage>(id, kPluginName); };
 
-        changeIndicator = shader(0x00C);     // MuffleFXShader_PYSChangeIndicator (white)
-        overrideShaders[1] = shader(0x004);  // MuffleFXShader_PYSDisable (red)
-        resumeShaders[1] = shader(0x005);    // MuffleFXShader_PYSEnable (green)
-        overrideShaders[2] = shader(0x006);  // MuffleFXShader_PYSDisableAlt (orange)
-        resumeShaders[2] = shader(0x007);    // MuffleFXShader_PYSEnableAlt (blue)
-        overrideShaders[3] = shader(0x00B);  // MuffleFXShader_PYSDisableAlt2 (yellow)
-        resumeShaders[3] = shader(0x00A);    // MuffleFXShader_PYSEnableAlt2 (purple)
-        walkMsg = message(0x008);            // PYS_WalkMsg
-        runMsg = message(0x009);             // PYS_RunMsg
-        pauseMsg = message(0x00D);           // PYS_PauseMsg
-        resumeMsg = message(0x00E);          // PYS_ResumeMsg
+        changeIndicator = shader(0xC75);     // MuffleFXShader_PYSChangeIndicator (white)
+        overrideShaders[1] = shader(0xC6D);  // MuffleFXShader_PYSDisable (red)
+        resumeShaders[1] = shader(0xC6E);    // MuffleFXShader_PYSEnable (green)
+        overrideShaders[2] = shader(0xC6F);  // MuffleFXShader_PYSDisableAlt (orange)
+        resumeShaders[2] = shader(0xC70);    // MuffleFXShader_PYSEnableAlt (blue)
+        overrideShaders[3] = shader(0xC74);  // MuffleFXShader_PYSDisableAlt2 (yellow)
+        resumeShaders[3] = shader(0xC73);    // MuffleFXShader_PYSEnableAlt2 (purple)
+        walkMsg = message(0xC71);            // PYS_WalkMsg
+        runMsg = message(0xC72);             // PYS_RunMsg
+        pauseMsg = message(0xC76);           // PYS_PauseMsg
+        resumeMsg = message(0xC77);          // PYS_ResumeMsg
         resolved = true;
 
         bool allFound = changeIndicator && walkMsg && runMsg && pauseMsg && resumeMsg;

@@ -30,9 +30,7 @@ Function UpdateNativeConfig(GlobalVariable PYS_Active, int combatRunSetting, boo
 	SetMovementConfig(PYS_Active.GetValueInt() != 0, combatRunSetting, walkInTowns, walkInTownsUnwalled, walkInDungeons, maxDistance)
 EndFunction
 
-Function CheckGamepad()	Global
-
-	PYS_MCMScript MCM = Game.GetFormFromFile(2817, "PaceYourself.esp") as PYS_MCMScript
+Function CheckGamepad(PYS_MCMScript MCM) Global
 
 	if Game.UsingGamepad()
 		MCM.LogMsg("Gamepad detected.")
